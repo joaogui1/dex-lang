@@ -20,6 +20,9 @@ or these example programs:
   * [Basis function regression](https://google-research.github.io/dex-lang/regression.html)
   * [Brownian bridge](https://google-research.github.io/dex-lang/brownian_motion.html)
 
+Please note that Dex is an experimental research project at an early stage of
+development. We welcome contributions. There's plenty of work to do!
+
 ## Setup
 
   * Install [stack](https://www.haskellstack.org)
@@ -27,9 +30,9 @@ or these example programs:
 
 ## Building
 
- * Build Dex: `make`
+ * Build Dex: `make`  (on non-Linux run `make all-non-linux`)
  * Run tests: `make tests`
- * Set up alias (e.g. in .bashrc) `alias dex=stack exec dex --`
+ * Set up alias (e.g. in .bashrc) `alias dex="stack exec dex --"`
 
 ## Running
 
