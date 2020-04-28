@@ -23,26 +23,20 @@ import Codec.Picture.Png
 import Codec.Picture.Types
 import qualified Data.Vector as V
 
-import Syntax hiding (Heatmap)
-import Record
-
 data Scale = LinearScale Double Double
 
-scatterHtml :: Value -> H.Html
-scatterHtml (Value _ vecs) = diagramToHtml $
+scatterHtml :: [Double] -> [Double] -> H.Html
+scatterHtml xs ys = diagramToHtml $
   position [(p2 (scaleToPlot xsc x, scaleToPlot ysc y), spot)
            | (x,y) <- zip xs ys]
   where
-    RecTree (Tup [RecLeaf (RealVec xs), RecLeaf (RealVec ys)]) = vecs
     spot = circle 0.005 # fc blue # lw 0
     xsc = LinearScale (minimum xs) (maximum xs)
     ysc = LinearScale (minimum ys) (maximum ys)
 
-heatmapHtml :: Value -> H.Html
-heatmapHtml (Value ty vecs) = pngToHtml $ generateImage getPix w h
+heatmapHtml :: Int -> Int -> [Double] -> H.Html
+heatmapHtml h w zs = pngToHtml $ generateImage getPix w h
   where
-    TabType (IdxSetLit h) (TabType (IdxSetLit w) _) = ty
-    RecLeaf (RealVec zs) = vecs
     zsVec = V.fromList zs
     zScale = LinearScale (minimum zs) (maximum zs)
     getPix i j = greyPix zScale $ zsVec  V.! (j * w + i)
@@ -55,7 +49,7 @@ doubleTo8Bit :: Double -> Int
 doubleTo8Bit x = min 255 $ max 0 (round (256 * x) :: Int)
 
 scaleToPlot :: Scale -> Double -> Double
-scaleToPlot (LinearScale low high) x = (x - low) / (high - low)
+scaleToPlot (LinearScale low high) x = (x - low) / (high - low + 1e-6)
 
 pngToHtml :: PngSavable a => Image a -> H.Html
 pngToHtml png = H.img H.! At.class_ "plot-img" H.! At.src

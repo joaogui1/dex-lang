@@ -4,104 +4,71 @@
 -- license that can be found in the LICENSE file or at
 -- https://developers.google.com/open-source/licenses/bsd
 
+{-# LANGUAGE LambdaCase #-}
+
 import System.Console.Haskeline
 import System.Exit
 import Control.Monad
 import Control.Monad.State.Strict
 import Options.Applicative
-import Data.Semigroup ((<>))
-import Data.Void
+import System.Posix.Terminal (queryTerminal)
+import System.Posix.IO (stdOutput)
 
 import Syntax
 import PPrint
 import RenderHtml
-import Pass
-import Type
 
-import Parser
-import DeShadow
-import Inference
-import Imp
-import JIT
-import Flops
-#ifdef DEX_WEB
-import WebOutput
-#endif
-import Normalize
-import Interpreter
+import TopLevel
+import Parser  hiding (Parser)
+import LiveOutput
 
-data Backend = Jit | Interp
 data ErrorHandling = HaltOnErr | ContinueOnErr
 data DocFmt = ResultOnly | TextDoc | HtmlDoc
-data EvalMode = ReplMode
-              | WebMode FName
-              | ScriptMode FName DocFmt ErrorHandling
-type PreludeFile = String
-data EvalOpts = EvalOpts Backend (Maybe PreludeFile)
+data EvalMode = ReplMode String
+              | WebMode    FilePath
+              | WatchMode  FilePath
+              | ScriptMode FilePath DocFmt ErrorHandling
 data CmdOpts = CmdOpts EvalMode EvalOpts
 
-type FName = String
-
-typeCheckPass :: TopPass SourceBlock TopDecl
-typeCheckPass = sourcePass >+> deShadowPass >+> typePass >+> checkTyped
-
-fullPassInterp :: TopPass SourceBlock Void
-fullPassInterp = typeCheckPass >+> interpPass
-
-fullPassJit :: TopPass SourceBlock Void
-fullPassJit = typeCheckPass
-          >+> normalizePass >+> checkNExpr
-          >+> simpPass      >+> checkNExpr
-          >+> impPass       >+> checkImp
-          >+> flopsPass
-          >+> jitPass
-
-runMode :: Monoid env => EvalMode -> Maybe PreludeFile -> FullPass env -> IO ()
-runMode evalMode prelude pass = do
-  env <- execStateT (evalPrelude prelude pass) mempty
+runMode :: EvalMode -> EvalOpts -> IO ()
+runMode evalMode opts = do
+  env <- execStateT (evalPrelude opts) mempty
   let runEnv m = evalStateT m env
   case evalMode of
-    ReplMode ->
-      runEnv $ runInputT defaultSettings $ forever (replLoop pass)
+    ReplMode prompt ->
+      runEnv $ runInputT defaultSettings $ forever (replLoop prompt opts)
     ScriptMode fname fmt _ -> do
-      results <- runEnv $ evalFile pass fname
-      putStr $ printLitProg fmt results
-#if DEX_WEB
-    WebMode fname -> runWeb fname pass env
-#else
-    WebMode _ -> error "Compiled without the web interface"
-#endif
+      results <- runEnv $ evalFile opts fname
+      printLitProg fmt results
+    WebMode   fname -> runWeb      fname opts env
+    WatchMode fname -> runTerminal fname opts env
 
-evalDecl :: Monoid env => FullPass env -> SourceBlock -> StateT env IO Result
-evalDecl pass block = do
+evalDecl :: EvalOpts -> SourceBlock -> StateT TopEnv IO Result
+evalDecl opts block = do
   env <- get
-  (ans, env') <- liftIO (runFullPass env pass block) `catch` (\e ->
-                   return (compilerErr (show (e::SomeException)), mempty))
+  (env', ans) <- liftIO (evalBlock opts env block)
   modify (<> env')
   return ans
 
-compilerErr :: String -> Result
-compilerErr s = Result $ Left $ Err CompilerErr Nothing s
-
-evalFile :: Monoid env =>
-              FullPass env-> String -> StateT env IO [(SourceBlock, Result)]
-evalFile pass fname = do
+evalFile :: EvalOpts -> FilePath -> StateT TopEnv IO [(SourceBlock, Result)]
+evalFile opts fname = do
   source <- liftIO $ readFile fname
   let sourceBlocks = parseProg source
-  results <- mapM (evalDecl pass) sourceBlocks
+  results <- mapM (evalDecl opts) sourceBlocks
   return $ zip sourceBlocks results
 
-evalPrelude :: Monoid env => Maybe PreludeFile -> FullPass env-> StateT env IO ()
-evalPrelude fname pass = do
-  result <- evalFile pass fname'
-  void $ liftErrIO $ mapM (\(_, (Result r)) -> r) result
-  where fname' = case fname of Just f -> f
-                               Nothing -> "prelude.dx"
+evalPrelude ::EvalOpts-> StateT TopEnv IO ()
+evalPrelude opts = do
+  result <- evalFile opts (preludeFile opts)
+  void $ liftErrIO $ mapM (\(_, Result _ r) -> r) result
 
-replLoop :: Monoid env => FullPass env-> InputT (StateT env IO) ()
-replLoop pass = do
-  sourceBlock <- readMultiline ">=> " parseTopDeclRepl
-  result <- lift $ evalDecl pass sourceBlock
+replLoop :: String -> EvalOpts -> InputT (StateT TopEnv IO) ()
+replLoop prompt opts = do
+  sourceBlock <- readMultiline prompt parseTopDeclRepl
+  env <- lift get
+  result <- lift $ (evalDecl opts) sourceBlock
+  case result of Result _ (Left _) -> lift $ put env
+                 _ -> return ()
   liftIO $ putStrLn $ pprint result
 
 liftErrIO :: MonadIO m => Except a -> m a
@@ -112,7 +79,7 @@ readMultiline :: (MonadException m, MonadIO m) =>
                    String -> (String -> Maybe a) -> InputT m a
 readMultiline prompt parse = loop prompt ""
   where
-    dots = replicate (length prompt - 1) '.' ++ " "
+    dots = replicate 3 '.' ++ " "
     loop prompt' prevRead = do
       source <- getInputLine prompt'
       case source of
@@ -125,41 +92,47 @@ readMultiline prompt parse = loop prompt ""
 simpleInfo :: Parser a -> ParserInfo a
 simpleInfo p = info (p <**> helper) mempty
 
-printLitProg :: DocFmt -> LitProg -> String
-printLitProg TextDoc    prog = foldMap (uncurry printLitBlock) prog
-printLitProg ResultOnly prog = foldMap (pprint . snd) prog
-printLitProg HtmlDoc    prog = progHtml prog
+printLitProg :: DocFmt -> LitProg -> IO ()
+printLitProg ResultOnly prog = putStr $ foldMap (pprint . snd) prog
+printLitProg HtmlDoc    prog = putStr $ progHtml prog
+printLitProg TextDoc    prog = do
+  isatty <- queryTerminal stdOutput
+  putStr $ foldMap (uncurry (printLitBlock isatty)) prog
 
 parseOpts :: ParserInfo CmdOpts
 parseOpts = simpleInfo $ CmdOpts <$> parseMode <*> parseEvalOpts
 
 parseMode :: Parser EvalMode
 parseMode = subparser $
-     (command "repl" $ simpleInfo (pure ReplMode))
-  <> (command "web"  $ simpleInfo (
-         WebMode <$> argument str (metavar "FILE" <> help "Source program")))
-  <> (command "script" $ simpleInfo (ScriptMode
-    <$> argument str (metavar "FILE" <> help "Source program")
-    <*> (   flag' TextDoc (long "lit"  <> help "Textual literate program output")
-        <|> flag' HtmlDoc (long "html" <> help "HTML literate program output")
-        <|> pure ResultOnly)
+     (command "repl" $ simpleInfo $
+         ReplMode <$> (strOption $ long "prompt" <> value ">=> "
+                         <> metavar "STRING" <> help "REPL prompt"))
+  <> (command "web"    $ simpleInfo (WebMode    <$> sourceFileInfo ))
+  <> (command "watch"  $ simpleInfo (WatchMode  <$> sourceFileInfo ))
+  <> (command "script" $ simpleInfo (ScriptMode <$> sourceFileInfo
+    <*> (   flag' HtmlDoc (long "html" <> help "HTML literate program output")
+        <|> pure TextDoc )
     <*> flag HaltOnErr ContinueOnErr (
                   long "allow-errors"
                <> help "Evaluate programs containing non-fatal type errors")))
+  where
+    sourceFileInfo = argument str (metavar "FILE" <> help "Source program")
+
+optionList :: [(String, a)] -> ReadM a
+optionList opts = eitherReader $ \s -> case lookup s opts of
+  Just x  -> Right x
+  Nothing -> Left $ "Bad option. Expected one of: " ++ show (map fst opts)
 
 parseEvalOpts :: Parser EvalOpts
 parseEvalOpts = EvalOpts
-                   <$> (flag Jit Interp $
-                         long "interp" <> help "Use interpreter backend")
-                   <*> (optional $ strOption $
-                            long "prelude"
-                         <> metavar "FILE"
-                         <> help "Alternative prelude file")
-
+  <$> (option
+         (optionList [("LLVM", LLVM), ("JAX", JAX), ("interp", Interp)])
+         (long "backend" <> value LLVM <> help "Backend (LLVM|JAX|interp)"))
+  <*> (strOption $ long "prelude" <> value "prelude.dx" <> metavar "FILE"
+                                  <> help "Prelude file" <> showDefault)
+  <*> (flag False True $ long "logall" <> help "Log all debug info")
 
 main :: IO ()
 main = do
-  CmdOpts evalMode (EvalOpts backend prelude) <- execParser parseOpts
-  case backend of
-    Jit    -> case fullPassJit    of TopPass f -> runMode evalMode prelude f
-    Interp -> case fullPassInterp of TopPass f -> runMode evalMode prelude f
+  CmdOpts evalMode opts <- execParser parseOpts
+  runMode evalMode opts

@@ -6,7 +6,7 @@
 
 {-# LANGUAGE OverloadedStrings #-}
 
-module Flops (flopsPass) where
+module Flops (moduleFlops) where
 
 import Control.Monad.Reader
 import Control.Monad.Writer
@@ -15,23 +15,16 @@ import Data.Text.Prettyprint.Doc hiding (group)
 
 import Syntax
 import Env
-import Pass
 import PPrint
 
 data Term = Term Int [(Name, Int)]  deriving (Show, Eq, Ord)
 type Count = [Term]
-newtype Profile = Profile (M.Map Builtin Count)
+newtype Profile = Profile (M.Map String Count)
 
 type FlopM a = ReaderT Term (Writer Profile) a
 
-flopsPass :: TopPass ImpDecl ImpDecl
-flopsPass = TopPass flopsPass'
-
-flopsPass' :: ImpDecl -> TopPassM () ImpDecl
-flopsPass' (ImpEvalCmd _ _ (Command Flops prog)) = do
-  let ans = snd $ runWriter (runReaderT (flops prog) (litTerm 1))
-  emitOutput $ TextOut $ pprint ans
-flopsPass' decl = return decl
+moduleFlops :: ImpModBody -> Profile
+moduleFlops (ImpModBody _ prog _) = snd $ runWriter (runReaderT (flops prog) (litTerm 1))
 
 flops :: ImpProg -> FlopM ()
 flops (ImpProg []) = return ()
@@ -39,19 +32,27 @@ flops (ImpProg (statement:rest)) = do
   statementFlops statement
   flops (ImpProg rest)
 
-statementFlops :: Statement -> FlopM ()
-statementFlops statement = case statement of
-  Alloc _ body -> flops body  -- TODO: count memory allocation
-  Update _ _ b _ _ -> do
+statementFlops :: ImpStatement -> FlopM ()
+statementFlops (_, instr) = case instr of
+  IPrimOp op -> do
     n <- ask
-    tell $ Profile $ M.singleton b [n]
-  Loop _ size block -> do
-    let n = evalSizeExpr  size
+    let (blankOp, _) =  unzipExpr op
+    tell $ Profile $ M.singleton (nameToStr (OpExpr blankOp)) [n]
+  Load _    -> return ()
+  Store _ _ -> return ()
+  Copy  _ _ -> do
+    n <- ask
+    tell $ Profile $ M.singleton "copy" [n]
+  Alloc _   -> return ()
+  Free _    -> return ()
+  IGet _ _  -> return ()
+  Loop _ _ size block -> do
+    let n = evalSizeExpr size
     local (mulTerm n) $ flops block
 
 evalSizeExpr :: IExpr -> Term
 evalSizeExpr (ILit (IntLit n)) = litTerm n
-evalSizeExpr (IVar v) = varTerm v
+evalSizeExpr (IVar (v:>_)) = varTerm v
 evalSizeExpr expr = error $ "Not implemented: " ++ pprint expr
 
 litTerm :: Int -> Term

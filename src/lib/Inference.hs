@@ -5,15 +5,17 @@
 -- https://developers.google.com/open-source/licenses/bsd
 
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
 
-module Inference (typePass, inferKinds) where
+module Inference (inferModule) where
 
 import Control.Monad
 import Control.Monad.Reader
-import Control.Monad.Except (liftEither)
-import Control.Monad.Writer
-import Control.Monad.Except (throwError)
-import Data.Foldable (fold)
+import Control.Monad.Except hiding (Except)
+import Data.Foldable (toList, fold)
+import qualified Data.Map.Strict as M
 import Data.Text.Prettyprint.Doc
 
 import Syntax
@@ -21,324 +23,552 @@ import Env
 import Record
 import Type
 import PPrint
-import Fresh
-import Pass
 import Cat
-import Interpreter
+import Subst
 
-data Constraint = Constraint Type Type String Ctx
-type QVars = Env ()
-type Ctx = Maybe SrcPos
+type InferM = ReaderT TypeEnv (SolverT (Either Err))
 
-type InferM a = ReaderT (Ctx, TypeEnv) (
-                  WriterT [Constraint]
-                    (CatT QVars (Either Err))) a
+inferModule :: TopEnv -> FModule -> Except FModule
+inferModule (TopEnv tyEnv subEnv _) m = do
+  let (Module (imports, exports) (FModBody body _)) = m
+  checkImports tyEnv m
+  let tySubEnv = flip envMapMaybe subEnv $ \case L _ -> Nothing; T ty -> Just ty
+  (body', tySub) <- expandTyAliases tySubEnv body
+  (body'', envOut) <- runInferM tyEnv $ catTraverse (inferDecl noEffect) body'
+  let imports' = imports `envIntersect` tyEnv
+  let exports' = exports `envIntersect` (tyEnv <> envOut <> tySubEnvType)
+       where tySubEnvType = fmap (T . getKind) tySub
+  return $ Module (imports', exports') (FModBody body'' tySub)
 
-typePass :: TopPass UTopDecl TopDecl
-typePass = TopPass $ \tdecl -> case tdecl of
-  TopDecl decl -> do
-    (decl', env') <- liftTop $ inferDecl decl
-    extend env'
-    return $ TopDecl decl'
-  -- TODO: special case for `GetType (Var v [])` which can be polymorphic
-  EvalCmd (Command cmd expr) -> do
-    case cmd of
-      GetType -> do
-        (ty, _) <- liftTop $ inferAndGeneralize expr
-        emitOutput $ TextOut $ pprint ty
-      _ -> do
-        (_, expr') <- liftTop $ solveLocalMonomorphic $ infer expr
-        case cmd of
-          ShowTyped -> emitOutput $ TextOut $ pprint expr'
-          _ -> return $ EvalCmd (Command cmd expr')
+runInferM :: (TySubst a, Pretty a) => TypeEnv -> InferM a -> Except a
+runInferM env m = runSolverT (runReaderT m env)
 
-liftTop :: InferM a -> TopPassM TypeEnv a
-liftTop m = do
-  env <- look
-  -- TODO: check returned qs and cs are empty
-  ((ans, _), _) <- liftExceptTop $ flip runCatT mempty $
-                        runWriterT $ flip runReaderT (Nothing, env) $ m
-  return ans
+expandTyAliases :: Env Type -> [FDecl] -> Except ([FDecl], Env Type)
+expandTyAliases envInit decls =
+  liftM snd $ flip runCatT ([], envInit) $ forM_ decls expandTyAliasDecl
 
-inferDecl :: UDecl -> InferM (Decl, TypeEnv)
-inferDecl decl = case decl of
+expandTyAliasDecl :: FDecl -> CatT ([FDecl], Env Type) (Either Err) ()
+expandTyAliasDecl decl = do
+  env <- looks snd
+  case decl of
+    TyDef v ty -> do
+      let ty' = tySubst env ty
+      ty'' <- liftEither $ runInferKinds mempty TyKind ty'
+      extend ([], v @> ty'')
+    _ -> extend ([tySubst env decl], mempty)
+
+checkImports :: TypeEnv -> FModule -> Except ()
+checkImports env m = do
+  let unboundVars = envNames $ imports `envDiff` env
+  unless (null unboundVars) $ throw UnboundVarErr $ pprintList unboundVars
+  let shadowedVars = envNames $ exports `envIntersect` env
+  unless (null shadowedVars) $ throw RepeatedVarErr $ pprintList shadowedVars
+  where (imports, exports) = moduleType m
+
+inferDecl :: Effect -> FDecl -> InferM (FDecl, TypeEnv)
+inferDecl eff decl = case decl of
   LetMono p bound -> do
     -- TOOD: better errors - infer polymorphic type to suggest annotation
-    (p', bound') <- solveLocalMonomorphic $ do
-                      p' <- annotPat p
-                      bound' <- check bound (patType p')
-                      return (p', bound')
+    liftEither $ checkPatShadow p
+    p' <- annotPat p
+    bound' <- check bound (eff, getType p')
     return (LetMono p' bound', foldMap asEnv p')
-  LetPoly b@(_:> Forall _ tyBody) (TLam tbs tlamBody) -> do
-    let vs = [v | (v:>_) <- tbs]
-        tyBody' = instantiateTVs (map TypeVar vs) tyBody
-    -- TODO: check if bound vars leaked (can look at constraints from solve)
-    tlamBody' <- checkLeaks vs $ solveLocalMonomorphic $
-                   extendRSnd (foldMap tbind tbs) $ check tlamBody tyBody'
-    return (LetPoly b (TLam tbs tlamBody'), lbind b)
-  Unpack (v:>_) tv bound -> do
-    (maybeEx, bound') <- solveLocalMonomorphic $ infer bound
-    boundTy <- case maybeEx of Exists t -> return $ instantiateTVs [TypeVar tv] t
-                               _ -> throw TypeErr (pprint maybeEx)
-    -- TODO: check possible type annotation
-    let b' = v :> boundTy
-    return (Unpack b' tv bound', asEnv b')
-  TAlias _ _ -> error "Shouldn't have TAlias left"
+  LetPoly b@(v:>ty) tlam -> do
+    ty' <- inferKinds TyKind ty
+    tlam' <- checkTLam ty' tlam
+    return (LetPoly (v:>ty') tlam', b @> L ty')
+  FRuleDef ann annTy tlam -> do
+    -- TODO: check against expected type for the particular rule
+    annTy' <- inferKinds TyKind annTy
+    tlam' <- checkTLam annTy' tlam
+    return (FRuleDef ann annTy' tlam', mempty)
+  TyDef _ _ -> error "Shouldn't have TyDef left"
 
-infer :: UExpr -> InferM (Type, Expr)
-infer expr = do ty <- freshQ
-                expr' <- check expr ty
-                return (ty, expr')
-
-check :: UExpr -> Type -> InferM Expr
-check expr reqTy = case expr of
-  Lit c -> do
-    constrainReq (BaseType (litType c))
-    return (Lit c)
-  Var v ts -> do
-    maybeTy <- asks $ flip envLookup v . snd
-    Forall kinds body <- case maybeTy of
-      Nothing -> throw UnboundVarErr (pprint v)
-      Just (L ty) -> return ty
-      Just (T _ ) -> error "Expected let-bound var"
-    vs <- mapM (const freshQ) (drop (length ts) kinds)
-    let ts' = ts ++ vs
-    constrainReq (instantiateTVs ts' body)
-    return $ Var v ts'
-  PrimOp b [] args -> do
-    let BuiltinType kinds argTys ansTy = builtinType b
-    vs <- mapM (const freshQ) kinds
-    constrainReq (instantiateTVs vs ansTy)
-    let argTys' = map (instantiateTVs vs) argTys
-    args' <- zipWithM check args argTys'
-    return $ PrimOp b vs args'
-  Decl decl@(Unpack _ tv _) body -> do
-    (decl', env') <- inferDecl decl
-    body' <- checkLeaks [tv] $ solveLocalMonomorphic $ extendRSnd env' $
-               check body reqTy
-    return $ Decl decl' body'
-  Decl decl body -> do
-    (decl', env') <- inferDecl decl
-    body' <- extendRSnd env' $ check body reqTy
-    return $ Decl decl' body'
-  Lam p body -> do
-    (a, b) <- splitFun expr reqTy
-    p' <- solveLocalMonomorphic $ checkPat p a
-    body' <- extendRSnd (foldMap asEnv p') (check body b)
-    return $ Lam p' body'
-  App fexpr arg -> do
-    (f, fexpr') <- infer fexpr
-    (a, b) <- splitFun fexpr f
-    arg' <- check arg a
+check :: FExpr -> EffectiveType -> InferM FExpr
+check expr reqEffTy@(allowedEff, reqTy) = case expr of
+  FDecl decl body -> do
+    (decl', env') <- inferDecl allowedEff decl
+    body' <- extendR env' $ check body reqEffTy
+    return $ FDecl decl' body'
+  FVar v -> do
+    ty <- asks $ fromL . (! v)
+    case ty of
+      Forall _ _ _ -> check (fTyApp v []) reqEffTy
+      _ -> constrainReq ty >> return (FVar (varName v :> ty))
+  FPrimExpr (OpExpr (TApp (FVar v) ts)) -> do
+    ty <- asks $ fromL . (! v)
+    case ty of
+      Forall bs _ body -> do
+        let kinds = map varAnn bs
+        ts' <- zipWithM inferKinds kinds ts
+        vs <- mapM freshInferenceVar (drop (length ts) kinds)
+        let ts'' = ts' ++ vs
+        let env = newTEnv bs ts''
+        constrainReq (subst (env, mempty) body)
+        return $ fTyApp (varName v :> ty) ts''
+      _ -> throw TypeErr "Unexpected type application"
+  FPrimExpr (OpExpr (App l f x)) -> do
+    l'  <- inferKinds MultKind l
+    piTy@(Pi a _) <- freshLamType
+    f' <- checkPure f $ ArrowType l' piTy
+    x' <- checkPure x a
+    piTy' <- zonk piTy
+    (eff, b) <- maybeApplyPi piTy' (fromAtomicFExpr x')
     constrainReq b
-    return $ App fexpr' arg'
-  For p body -> do
-    (a, b) <- splitTab expr reqTy
-    p' <- checkPat p a
-    body' <- extendRSnd (foldMap asEnv p') (check body b)
-    return $ For p' body'
-  Get tabExpr idxExpr -> do
-    (tabTy, tabExpr') <- infer tabExpr
-    (i, v) <- splitTab tabExpr tabTy
-    idxExpr' <- check idxExpr i
-    constrainReq v
-    return $ Get tabExpr' idxExpr'
-  RecCon r -> do
-    tyExpr <- traverse infer r
-    constrainReq (RecType (fmap fst tyExpr))
-    return $ RecCon (fmap snd tyExpr)
-  TabCon _ xs -> do
-    (n, elemTy) <- splitTab expr reqTy
-    xs' <- mapM (flip check elemTy) xs
-    let n' = length xs
-    -- `==> elemTy` for better messages
-    constrainEq (n ==> elemTy) (IdxSetLit n' ==> elemTy) (pprint expr)
-    return $ TabCon reqTy xs'
-  Pack e ty exTy -> do
-    let (Exists exBody) = exTy
-    constrainReq exTy
-    let t = instantiateTVs [ty] exBody
-    e' <- check e t
-    return $ Pack e' ty exTy
-  DerivAnnot e ann -> do
-    e' <- check e reqTy
-    ann' <- check ann (tangentBunType reqTy) -- TODO: handle type vars and meta vars)
-    return $ DerivAnnot e' ann'
+    eff' <- openEffect eff
+    constrainEq allowedEff eff' (pprint expr)
+    return $ FPrimExpr $ OpExpr $ App l' f' x'
+  FPrimExpr (OpExpr (Inject e)) -> do
+    et <- freshQ
+    e' <- checkPure e et
+    et' <- zonk et
+    case et' of
+      TC (IndexRange ty _ _) -> do
+        constrainReq ty
+        return $ FPrimExpr $ OpExpr $ Inject e'
+      _ -> throw TypeErr "Expected index range"
+  FPrimExpr (OpExpr op) -> do
+    opTy <- generateOpSubExprTypes op
+    -- TODO: don't ignore explicit annotations (via `snd`)
+    (eff, ansTy) <- traverseOpType
+                      (fmapExpr opTy id (\(e,t)->(fromAtomicFExpr e, t)) snd)
+                      (\t1 t2 -> constrainEq t1 t2 (pprint expr))
+                      (\_ _ -> return ())
+                      (\_ _ -> return ())
+    op' <- traverseExpr opTy return (uncurry checkPure) (uncurry checkLam)
+    constrainReq ansTy
+    eff' <- openEffect eff
+    constrainEq allowedEff eff' (pprint expr)
+    return $ FPrimExpr $ OpExpr $ op'
+  FPrimExpr (ConExpr con) -> do
+    conTy <- generateConSubExprTypes con
+    -- TODO: don't ignore explicit annotations (via `snd`)
+    ansTy <- traverseConType (fmapExpr conTy id snd snd)
+               (\t1 t2 -> constrainEq t1 t2 (pprint expr))
+               (\_ _ -> return ())
+               (\_ _ -> return ())
+    constrainReq ansTy
+    con' <- traverseExpr conTy return (uncurry checkPure) (uncurry checkLam)
+    return $ FPrimExpr $ ConExpr con'
   Annot e annTy -> do
     -- TODO: check that the annotation is a monotype
     constrainReq annTy
-    check e reqTy
-  SrcAnnot e pos -> local (\(_,env) -> (Just pos, env)) (check e reqTy)
-  _ -> error $ "Unexpected expression: " ++ show expr
+    check e reqEffTy
+  SrcAnnot e pos -> do
+    e' <- addSrcContext (Just pos) $ check e reqEffTy
+    return $ SrcAnnot e' pos
   where
-    constrainReq ty = constrainEq reqTy ty (pprint expr)
+    constrainReq ty = constrainEq reqTy  ty       (pprint expr)
 
-checkLeaks :: [Name] -> InferM a -> InferM a
-checkLeaks vs m = do
-  (ans, cs) <- captureW m
-  sequence_ [checkVarConstraint v c | v <- vs, c <- cs]
-  tell cs
-  return ans
-  where
-    checkVarConstraint v (Constraint t1 t2 _ ctx) =
-      if v `isin` (freeVars t1 <> freeVars t2)
-        then throwError $ Err TypeErr ctx $
-               "\nLeaked type variable: " ++ pprint v
-        else return ()
+checkPure :: FExpr -> Type -> InferM FExpr
+checkPure expr ty = check expr (noEffect, ty)
 
-constrainEq :: Type -> Type -> String -> InferM ()
-constrainEq t1 t2 s = do
-  ctx <- asks fst
-  tell [Constraint t1 t2 s ctx]
+checkTLam :: Type -> FTLam -> InferM FTLam
+checkTLam ~(Forall tbs qs tyBody) (FTLam _ _ tlamBody) = do
+  let env = foldMap tbind tbs
+  liftM (FTLam tbs qs) $ checkLeaks tbs $ extendR env $
+    check tlamBody (noEffect, tyBody)
 
-checkPat :: UPat -> Type -> InferM Pat
+checkLam :: FLamExpr -> PiType -> InferM FLamExpr
+checkLam (FLamExpr p body) piTy@(Pi a _) = do
+  p' <- checkPat p a
+  piTy' <- zonk piTy
+  effTy <- maybeApplyPi piTy' (Just (Var (getPatName p :> a)))
+  body' <- extendR (foldMap asEnv p') $ check body effTy
+  return $ FLamExpr p' body'
+
+checkPat :: Pat -> Type -> InferM Pat
 checkPat p ty = do
+  liftEither $ checkPatShadow p
   p' <- annotPat p
-  constrainEq ty (patType p') (pprint p)
+  constrainEq ty (getType p') (pprint p)
   return p'
 
-annotPat :: MonadCat QVars m => UPat -> m Pat
+checkAtom :: Atom -> Type -> InferM Atom
+checkAtom atom ty = do
+  fexpr <- check (toAtomicFExpr atom) (noEffect, ty)
+  case fromAtomicFExpr fexpr of
+    Just atom' -> return atom'
+    Nothing -> error "Shouldn't be possible to infer an atom into a non-atom"
+
+fTyApp :: Var -> [Type] -> FExpr
+fTyApp v tys = FPrimExpr $ OpExpr $ TApp (FVar v) tys
+
+checkPatShadow :: Pat -> Except ()
+checkPatShadow pat = do
+  let dups = filter (/= NoName) $ findDups $ map varName $ toList pat
+  unless (null dups) $ throw RepeatedVarErr $ pprintList dups
+
+findDups :: Eq a => [a] -> [a]
+findDups [] = []
+findDups (x:xs) | x `elem` xs = x : findDups xs
+                | otherwise   =     findDups xs
+
+openEffect :: Effect -> InferM Effect
+openEffect eff = do
+  ~(Effect row tailVar) <- zonk eff
+  case tailVar of
+    Nothing -> liftM (Effect row . Just) $ freshInferenceVar EffectKind
+    Just _  -> return $ Effect row tailVar
+
+generateConSubExprTypes :: PrimCon Type e lam
+  -> InferM (PrimCon Type (e, Type) (lam, PiType))
+generateConSubExprTypes con = case con of
+  Lam l _ lam -> do
+    l' <- inferKinds MultKind l
+    lam'@(Pi _ (eff,_)) <- freshLamType
+    return $ Lam l' eff (lam, lam')
+  _ -> traverseExpr con (inferKinds TyKind) (doMSnd freshQ) (doMSnd freshLamType)
+
+generateOpSubExprTypes :: PrimOp Type FExpr FLamExpr
+  -> InferM (PrimOp Type (FExpr, Type) (FLamExpr, PiType))
+generateOpSubExprTypes op = case op of
+  TabGet xs i -> do
+    n <- freshQ
+    a <- freshQ
+    return $ TabGet (xs, n ==> a) (i, n)
+  PrimEffect ref m -> do
+    s  <- freshQ
+    m' <- traverse (doMSnd freshQ) m
+    return $ PrimEffect (ref, RefTy s) m'
+  RunReader r f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+    r' <- freshQ
+    a  <- freshQ
+    tailVar <- freshInferenceVar EffectKind
+    let refTy = RefTy r'
+    let eff = Effect ((v:>()) @> (Reader, refTy)) (Just tailVar)
+    let fTy = makePi (v:>refTy) (eff, a)
+    return $ RunReader (r, r') (f, fTy)
+  RunWriter f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+    w <- freshQ
+    a <- freshQ
+    tailVar <- freshInferenceVar EffectKind
+    let refTy = RefTy w
+    let eff = Effect ((v:>()) @> (Writer,refTy)) (Just tailVar)
+    let fTy = makePi (v:>refTy) (eff, a)
+    return $ RunWriter (f, fTy)
+  RunState s f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+    s' <- freshQ
+    a  <- freshQ
+    tailVar <- freshInferenceVar EffectKind
+    let refTy = RefTy s'
+    let eff = Effect ((v:>()) @> (State, refTy)) (Just tailVar)
+    let fTy = makePi (v:>refTy) (eff, a)
+    return $ RunState (s, s') (f, fTy)
+  IndexEff effName tabRef i f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+    i' <- freshQ
+    x  <- freshQ
+    a  <- freshQ
+    let tabType = i' ==> x
+    tailVar <- freshInferenceVar EffectKind
+    let eff = Effect ((v:>()) @> (effName, RefTy x)) (Just tailVar)
+    let fTy = makePi (v:> RefTy x) (eff, a)
+    return $ IndexEff effName (tabRef, RefTy tabType) (i, i') (f, fTy)
+  _ -> traverseExpr op (inferKinds TyKind) (doMSnd freshQ) (doMSnd freshLamType)
+
+freshLamType :: InferM PiType
+freshLamType = do
+  a <- freshQ
+  b <- freshQ
+  eff <- liftM (Effect mempty . Just) $ freshInferenceVar EffectKind
+  return $ Pi a (eff, b)
+
+doMSnd :: Monad m => m b -> a -> m (a, b)
+doMSnd m x = do { y <- m; return (x, y) }
+
+annotPat :: Pat -> InferM Pat
 annotPat pat = traverse annotBinder pat
 
-annotBinder :: MonadCat QVars m => UBinder -> m Binder
-annotBinder (v:>ann) = liftM (v:>) $ case ann of NoAnn  -> freshQ
-                                                 Ann ty -> return ty
+annotBinder :: Var -> InferM Var
+annotBinder (v:>ann) = liftM (v:>) (inferKinds TyKind ann)
 
-asEnv :: Binder -> TypeEnv
-asEnv (v:>ty) = v @> L (asSigma ty)
+asEnv :: Var -> TypeEnv
+asEnv b = b @> L (varAnn b)
 
--- TODO: consider expected/actual distinction. App/Lam use it in opposite senses
-splitFun :: UExpr -> Type -> InferM (Type, Type)
-splitFun expr f = case f of
-  ArrType a b -> return (a, b)
-  _ -> do a <- freshQ
-          b <- freshQ
-          constrainEq f (a --> b) (pprint expr)
-          return (a, b)
+-- === kind inference ===
 
-splitTab :: UExpr -> Type -> InferM (IdxSet, Type)
-splitTab expr t = case t of
-  TabType a b -> return (a, b)
-  _ -> do a <- freshQ
-          b <- freshQ
-          constrainEq t (a ==> b) (pprint expr)
-          return (a, b)
+type InferKindM a = ReaderT [Type] (CatT TypeEnv InferM) a
 
-freshQ :: MonadCat QVars m => m Type
-freshQ = do
-  tv <- looks $ rename (rawName "?")
-  extend $ tv @> ()
-  return (TypeVar tv)
+inferKinds :: Kind -> Type -> InferM Type
+inferKinds kind ty = do
+  env <- ask
+  liftM fst $ runCatT (runReaderT (inferKindsM kind ty) []) env
 
-inferAndGeneralize :: UExpr -> InferM (SigmaType, TLam)
-inferAndGeneralize expr = do
-  ((ty, expr'), qs) <- solveLocal $ infer expr
-  let sigmaTy = Forall (map (const TyKind) qs) $ abstractTVs qs ty
-  return (sigmaTy, TLam [] expr')  -- TODO: type-lambda too
+runInferKinds :: TypeEnv -> Kind -> Type -> Except Type
+runInferKinds env kind ty = liftM fst $ runInferM env $
+  runCatT (runReaderT (inferKindsM kind ty) []) env
 
-solveLocalMonomorphic :: (Pretty a, Subst a) => InferM a -> InferM a
-solveLocalMonomorphic m = do
-  (ans, uncQs) <- solveLocal m
-  case uncQs of
-    [] -> return ans
-    vs -> throw TypeErr $ "Ambiguous type variables: " ++ pprint vs
-                        ++ "\n\n" ++ pprint ans
+inferKindsM :: Kind -> Type -> InferKindM Type
+inferKindsM kind ty = case ty of
+  NoAnn -> lift $ lift $ freshInferenceVar kind
+  TypeVar tv@(v:>_) -> do
+    x <- looks $ flip envLookup tv
+    case x of
+      Just (T NoKindAnn) -> extend (tv @> T kind)
+      Just (T k)         -> checkKindEq kind k
+      _                  -> error "Lookup failed"
+    return $ TypeVar (v:>kind)
+  Forall vs qs body -> liftM fst $ scoped $ do
+    extend (foldMap tbind vs)
+    body' <- inferKindsM TyKind body
+    vs' <- mapM addKindAnn vs
+    let substEnv = newTEnv vs (map TypeVar vs')
+    let qs' = map (subst (substEnv, mempty)) $ qs ++ impliedClasses body
+    return $ Forall vs' qs' body'
+  TypeAlias vs body -> do
+    extend (foldMap tbind vs)
+    body' <- inferKindsM TyKind body
+    vs' <- mapM addKindAnn vs
+    return $ TypeAlias vs' body'
+  ArrowType m (Pi a (eff, b)) -> do
+    m' <- inferKindsM MultKind m
+    a' <- inferKindsM TyKind   a
+    local ([a'] <>) $ do
+      eff' <- inferKindsM EffectKind eff
+      b'   <- inferKindsM TyKind     b
+      return $ ArrowType m' $ Pi a' (eff', b')
+  Effect row tailVar -> do
+    checkKindEq kind EffectKind
+    row' <- liftM fold $ forM (envPairs row) $ \(v, (eff, NoAnn)) -> do
+      let v' = v:>()
+      t <- case v of
+             DeBruijn i -> asks (!! i)
+             _          -> looks $ fromL . (! v')
+      return (v' @> (eff, t))
+    tailVar' <- traverse (inferKindsM EffectKind) tailVar
+    return $ Effect row' tailVar'
+  TC con -> liftM TC $ do
+    con' <- traverseTyCon (fst $ tyConKind con)
+              (\(t,k) -> inferKindsM k t)
+              (return . fst)
+    traverseTyCon (fst $ tyConKind con')
+              (return . fst)
+              (\(x,t) -> lift $ lift $ checkAtom x t)
 
-solveLocal :: Subst a => InferM a -> InferM (a, [Name])
-solveLocal m = do
-  ((ans, freshQs), cs) <- captureW $ scoped m
-  (s, cs') <- liftEither $ solvePartial freshQs cs
-  tell $ cs'
-  let freshQs' = freshQs `envDiff` s
-      unconstrained = freshQs' `envDiff` fold [freeTyVars t1 <> freeTyVars t2
-                                                | Constraint t1 t2 _ _ <- cs']
-  extend $ freshQs' `envDiff` unconstrained
-  return (applySubst s ans, envNames unconstrained)
+addKindAnn :: TVar -> InferKindM TVar
+addKindAnn tv@(v:>_) = do
+  env <- look
+  case envLookup env tv of
+    Just (T NoKindAnn) ->
+      throw KindErr $ "Ambiguous kind for type variable: " ++ pprint tv
+    Just (T k) -> return (v:>k)
+    _ -> error "Lookup failed"
 
-solvePartial :: QVars -> [Constraint] -> Except (Env Type, [Constraint])
-solvePartial qs cs = do
-  s <- solve cs
-  return (envIntersect qs s, substAsConstraints (s `envDiff` qs))
-  where
-    -- We lost the source context when we solved this the first time
-    -- TODO: add context to subst
-    substAsConstraints env =
-          [Constraint (TypeVar v) ty "From subst" Nothing | (v, ty) <- envPairs env]
+-- TODO: this is quite ad-hoc
+impliedClasses :: Type -> [TyQual]
+impliedClasses ty =  map (flip TyQual Data  ) (dataVars   ty)
+                  <> map (flip TyQual IdxSet) (idxSetVars ty)
+
+idxSetVars :: Type -> [TVar]
+idxSetVars ty = case ty of
+  ArrowType _ (Pi a (_, b)) -> recur a <> recur b
+  TabTy a b -> map (:>NoKindAnn) (envNames (freeVars a)) <> recur b
+  RecTy r   -> foldMap recur r
+  _         -> []
+  where recur = idxSetVars
+
+dataVars :: Type -> [TVar]
+dataVars ty = case ty of
+  ArrowType _ (Pi a (_, b)) -> recur a <> recur b
+  TabTy _ b -> map (:>NoKindAnn) (envNames (freeVars b))
+  RecTy r   -> foldMap recur r
+  _         -> []
+  where recur = dataVars
 
 -- === constraint solver ===
 
-solve :: [Constraint] -> Except (Env Type)
-solve cs = do
-  ((), TSubst s) <- runCatT (mapM_ unifyC cs) mempty
-  return s
-  where
-    unifyC (Constraint t1 t2 s ctx) = do
-      t1' <- zonk t1
-      t2' <- zonk t2
-      let err = Err TypeErr ctx $
-                  "\nExpected: " ++ pprint t1'
-               ++ "\n  Actual: " ++ pprint t2'
-               ++ "\nIn: "       ++ s
-      unify err t1' t2'
+data SolverEnv = SolverEnv { solverVars :: Env Kind
+                           , solverSub  :: Env Type }
+type SolverT m = CatT SolverEnv m
 
-newtype TSubst = TSubst (Env Type)
-type SolveM a = CatT TSubst (Either Err) a
+runSolverT :: (MonadError Err m, TySubst a, Pretty a)
+           => CatT SolverEnv m a -> m a
+runSolverT m = liftM fst $ flip runCatT mempty $ do
+   ans <- m
+   applyDefaults
+   ans' <- zonk ans
+   vs <- looks $ envNames . unsolved
+   throwIf (not (null vs)) TypeErr $ "Ambiguous type variables: "
+                                   ++ pprint vs ++ "\n\n" ++ pprint ans
+   return ans'
 
--- TODO: check kinds
-unify :: Err -> Type -> Type -> SolveM ()
-unify err t1 t2 = do
+applyDefaults :: MonadCat SolverEnv m => m ()
+applyDefaults = do
+  vs <- looks unsolved
+  forM_ (envPairs vs) $ \(v, k) -> case k of
+    MultKind   -> addSub v NonLin
+    EffectKind -> addSub v noEffect
+    _ -> return ()
+  where addSub v ty = extend $ SolverEnv mempty ((v:>()) @> ty)
+
+solveLocal :: (Pretty a, MonadCat SolverEnv m, MonadError Err m, TySubst a)
+           => m a -> m a
+solveLocal m = do
+  (ans, env@(SolverEnv freshVars sub)) <- scoped (m >>= zonk)
+  extend $ SolverEnv (unsolved env) (sub `envDiff` freshVars)
+  return ans
+
+checkLeaks :: (Pretty a, MonadCat SolverEnv m, MonadError Err m, TySubst a)
+           => [TVar] -> m a -> m a
+checkLeaks tvs m = do
+  (ans, env) <- scoped $ solveLocal m
+  forM_ (solverSub env) $ \ty ->
+    forM_ tvs $ \tv ->
+      throwIf (tv `occursIn` ty) TypeErr $ "Leaked type variable: " ++ pprint tv
+  extend env
+  return ans
+
+unsolved :: SolverEnv -> Env Kind
+unsolved (SolverEnv vs sub) = vs `envDiff` sub
+
+freshQ :: (MonadError Err m, MonadCat SolverEnv m) => m Type
+freshQ = freshInferenceVar $ TyKind
+
+freshInferenceVar :: (MonadError Err m, MonadCat SolverEnv m) => Kind -> m Type
+freshInferenceVar k = do
+  tv <- looks $ rename (rawName InferenceName "?" :> k) . solverVars
+  extend $ SolverEnv (tv @> k) mempty
+  return (TypeVar tv)
+
+constrainEq :: (MonadCat SolverEnv m, MonadError Err m)
+             => Type -> Type -> String -> m ()
+constrainEq t1 t2 s = do
   t1' <- zonk t1
   t2' <- zonk t2
+  let msg = "\nExpected: " ++ pprint t1'
+         ++ "\n  Actual: " ++ pprint t2'
+         ++ "\nIn: "       ++ s
+  addContext msg $ unify t1' t2'
+
+zonk :: (TySubst a, MonadCat SolverEnv m) => a -> m a
+zonk x = do
+  s <- looks solverSub
+  return $ tySubst s x
+
+-- TODO: check kinds
+unify :: (MonadCat SolverEnv m, MonadError Err m)
+       => Type -> Type -> m ()
+unify t1 t2 = do
+  t1' <- zonk t1
+  t2' <- zonk t2
+  vs <- looks solverVars
   case (t1', t2') of
     _ | t1' == t2' -> return ()
-    (t, TypeVar v) | isQ v -> bindQ v t
-    (TypeVar v, t) | isQ v -> bindQ v t
-    (ArrType a b, ArrType a' b') -> recur a a' >> recur b b'
-    (TabType a b, TabType a' b') -> recur a a' >> recur b b'
-    (Exists t, Exists t')        -> recur t t'
-    (RecType r, RecType r')      ->
-      case zipWithRecord recur r r' of
-             Nothing -> throwError err
-             Just unifiers -> void $ sequence unifiers
-    _ -> throwError err
-  where
-    recur = unify err
+    (t, TypeVar v) | v `isin` vs -> bindQ v t
+    (TypeVar v, t) | v `isin` vs -> bindQ v t
+    (ArrowType l (Pi a (eff, b)), ArrowType l' (Pi a' (eff', b'))) -> do
+      -- TODO: think very hard about the leak checks we need to add here
+      unify l l' >> unify a a' >> unify b b' >> unify eff eff'
+    (Effect r t, Effect r' t') -> do
+      let shared = rowMeet r r'
+      forM_ shared $ \((e, et), (e', et')) -> do
+        when (e /= e') $ throw TypeErr "Effect mismatch"
+        unify et et'
+      newTail <- liftM Just $ freshInferenceVar EffectKind
+      matchTail t  $ Effect (envDiff r' shared) newTail
+      matchTail t' $ Effect (envDiff r  shared) newTail
+    (TC con, TC con') -> case (con, con') of
+      (TabType a b, TabType a' b') -> unify a a' >> unify b b'
+      (RefType a, RefType a') -> unify a a'
+      (RecType r, RecType r') ->
+        case zipWithRecord unify r r' of
+          Nothing -> throw TypeErr ""
+          Just unifiers -> void $ sequence unifiers
+      (TypeApp f xs, TypeApp f' xs') | length xs == length xs' ->
+        unify f f' >> zipWithM_ unify xs xs'
+      _ -> throw TypeErr ""
+    _   -> throw TypeErr ""
 
-isQ :: Name -> Bool
-isQ (Name ('?':_) _) = True
-isQ _ = False
+rowMeet :: Env a -> Env b -> Env (a, b)
+rowMeet (Env m) (Env m') = Env $ M.intersectionWith (,) m m'
 
-bindQ :: Name -> Type -> SolveM ()
+-- TODO: can we make this less complicated?
+matchTail :: (MonadCat SolverEnv m, MonadError Err m)
+          => Maybe Type -> Effect -> m ()
+matchTail t ~eff@(Effect row t') = do
+  vs <- looks solverVars
+  case (t, t') of
+    _                     | t == t' && row == mempty     -> return ()
+    (Just (TypeVar v), _) | v `isin` vs                  -> zonk eff               >>= bindQ v
+    (_, Just (TypeVar v)) | v `isin` vs && row == mempty -> zonk (Effect mempty t) >>= bindQ v
+    _ -> throw TypeErr ""
+
+bindQ :: (MonadCat SolverEnv m, MonadError Err m) => TVar -> Type -> m ()
 bindQ v t | v `occursIn` t = throw TypeErr (pprint (v, t))
-          | otherwise = extend $ TSubst (v @> t)
+          | otherwise = extend $ mempty { solverSub = v @> t }
 
-occursIn :: Name -> Type -> Bool
-occursIn v t = v `isin` freeTyVars t
+occursIn :: TVar -> Type -> Bool
+occursIn v t = v `isin` freeVars t
 
-zonk :: Type -> SolveM Type
-zonk ty = do
-  TSubst s <- look
-  return $ applySubst s ty
-
-instance Semigroup TSubst where
+instance Semigroup SolverEnv where
+  -- TODO: as an optimization, don't do the subst when sub2 is empty
   -- TODO: make concatenation more efficient by maintaining a reverse-lookup map
-  TSubst s1 <> TSubst s2 = TSubst (s1' <> s2)
-    where s1' = fmap (applySubst s2) s1
+  SolverEnv scope1 sub1 <> SolverEnv scope2 sub2 =
+    SolverEnv (scope1 <> scope2) (sub1' <> sub2)
+    where sub1' = fmap (tySubst sub2) sub1
 
-instance Monoid TSubst where
-  mempty = TSubst mempty
+instance Monoid SolverEnv where
+  mempty = SolverEnv mempty mempty
   mappend = (<>)
 
--- === misc ===
+-- === type substitutions ===
 
-freeTyVars :: Type -> Env ()
-freeTyVars ty = fmap (const ()) (freeVars ty)
+class TySubst a where
+  tySubst :: Env Type -> a -> a
 
-inferKinds :: [Name] -> Type -> Except [Kind]
-inferKinds vs _ = return $ map (const TyKind) vs  -- TODO: other kinds
+instance TySubst Type where
+  tySubst env ty = subst (fmap T env, mempty) ty
 
-applySubst :: Subst a => Env Type -> a -> a
-applySubst s x = runReader (subst x) (fmap T s, mempty)
+instance TySubst PiType where
+  tySubst env ty = subst (fmap T env, mempty) ty
 
-extendRSnd :: (Monoid env, MonadReader (b, env) m) => env -> m a -> m a
-extendRSnd env m = local (\(x, env') -> (x, env' <> env)) m
+instance TySubst FExpr where
+  tySubst env expr = case expr of
+    FDecl decl body  -> FDecl (tySubst env decl) (tySubst env body)
+    FVar (v:>ty)     -> FVar (v:>tySubst env ty)
+    Annot e ty       -> Annot (tySubst env e) (tySubst env ty)
+    SrcAnnot e src   -> SrcAnnot (tySubst env e) src
+    FPrimExpr e -> FPrimExpr $ tySubst env e
+
+instance TySubst Atom where
+  tySubst env atom = subst (fmap T env, mempty) atom
+
+instance (TraversableExpr expr, TySubst ty, TySubst e, TySubst lam)
+         => TySubst (expr ty e lam) where
+  tySubst env expr = fmapExpr expr (tySubst env) (tySubst env) (tySubst env)
+
+instance TySubst FLamExpr where
+  tySubst env (FLamExpr p body) = FLamExpr (tySubst env p) (tySubst env body)
+
+instance TySubst FDecl where
+  tySubst env decl = case decl of
+    LetMono p e -> LetMono (fmap (tySubst env) p) (tySubst env e)
+    LetPoly ~(v:>Forall ks qs ty) lam ->
+      LetPoly (v:>Forall ks qs (tySubst env ty)) (tySubst env lam)
+    TyDef v ty -> TyDef v (tySubst env ty)
+    FRuleDef ann ty lam -> FRuleDef ann (tySubst env ty) (tySubst env lam)
+
+instance TySubst FTLam where
+  tySubst env (FTLam bs qs body) = FTLam bs qs (tySubst env body)
+
+instance (TySubst a, TySubst b) => TySubst (a, b) where
+  tySubst env (x, y) = (tySubst env x, tySubst env y)
+
+instance TySubst a => TySubst (VarP a) where
+  tySubst env (v:>ty) = v:> tySubst env ty
+
+instance TySubst a => TySubst (RecTree a) where
+  tySubst env p = fmap (tySubst env) p
+
+instance TySubst a => TySubst (Env a) where
+  tySubst env xs = fmap (tySubst env) xs
+
+instance (TySubst a, TySubst b) => TySubst (LorT a b) where
+  tySubst env (L x) = L (tySubst env x)
+  tySubst env (T y) = T (tySubst env y)
+
+instance TySubst a => TySubst [a] where
+  tySubst env xs = map (tySubst env) xs
+
+instance TySubst Kind where
+  tySubst _ k = k

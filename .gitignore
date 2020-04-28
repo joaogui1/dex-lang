@@ -7,7 +7,12 @@ test-script.cd
 *.out
 *.so
 .stack-work
+.stack-work-prof
 garbage.hs
 stack.yaml.lock
 *.pyc
 doc/
+scratch.dx
+scratch/
+test-scratch/
+dist-newstyle/

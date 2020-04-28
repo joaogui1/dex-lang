@@ -1,0 +1,43 @@
+# https://docs.haskellstack.org/en/stable/travis_ci/
+
+dist: bionic
+language: generic
+cache:
+  directories:
+  - $HOME/.local/bin
+  - $HOME/.stack
+  - $TRAVIS_BUILD_DIR/.stack-work
+
+addons:
+  apt:
+    update: true
+    packages:
+      - libgmp-dev
+      - llvm-9-tools
+      - llvm-9-dev
+      - python3-numpy
+      - haskell-stack
+jobs:
+  include:
+    - stage: Upgrade Stack
+      script:
+        - export DIR=~/.local/bin
+        - if [ ! -d "$DIR" ]; then mkdir -p ~/.local/bin; fi
+        - export PATH=$HOME/.local/bin:$PATH
+        - stack upgrade
+        - hash -r
+        - stack setup
+    - stage: Build dependencies
+      script:
+        - export PATH=$HOME/.local/bin:/usr/lib/llvm-9/bin:$PATH
+        - stack build --only-dependencies
+    - stage: Build
+      script:
+        - export PATH=$HOME/.local/bin:/usr/lib/llvm-9/bin:$PATH
+        - make
+    - stage: Test
+      script:
+        - export PATH=$HOME/.local/bin:/usr/lib/llvm-9/bin:$PATH
+        - make libdex
+        - stack install
+        - make tests

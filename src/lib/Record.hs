@@ -8,14 +8,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Record (Record (..), RecTree (..),
-               zipWithRecord, recZipWith, recTreeZipEq,
+               zipWithRecord, recZipWith, recZipWith3, recTreeZipEq,
                recGet, otherFields, recNameVals, RecField,
                recTreeJoin, unLeaf, RecTreeZip (..), recTreeNamed,
                recUpdate, fstField, sndField, recAsList, tupField, fromLeaf
               ) where
 
 
-import Util
 import Data.Traversable
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromJust)
@@ -58,7 +57,14 @@ zipWithRecord f (Tup xs) (Tup xs') | length xs == length xs' = Just $ Tup $ zipW
 zipWithRecord _ _ _ = Nothing
 
 recZipWith :: (a -> b -> c) -> Record a -> Record b -> Record c
-recZipWith f r r' = unJust (zipWithRecord f r r')
+recZipWith f r r' = case zipWithRecord f r r' of
+  Just ans -> ans
+  Nothing  -> error $ "Record mismatch: " ++ showIt r ++ " vs " ++ showIt r'
+    where showIt :: Record a -> String
+          showIt x = show (fmap (const ()) x)
+
+recZipWith3 :: (a -> b -> c -> d) -> Record a -> Record b -> Record c -> Record d
+recZipWith3 f r1 r2 r3 = recZipWith ($) (recZipWith f r1 r2) r3
 
 recTreeJoin :: RecTree (RecTree a) -> RecTree a
 recTreeJoin (RecLeaf t) = t
@@ -130,6 +136,7 @@ instance RecTreeZip (RecTree a) where
     -- Symmetric alternative: recTreeZip x (RecLeaf x') = RecLeaf (x, x')
 
 instance Pretty a => Pretty (Record a) where
+  pretty (Tup [x]) = "(" <> pretty x <> ",)"
   pretty r = align $ tupled $ case r of
                Rec m  -> [pretty k <> "=" <> pretty v | (k,v) <- M.toList m]
                Tup xs -> map pretty xs -- TODO: add trailing comma to singleton tuple

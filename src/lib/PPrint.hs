@@ -6,24 +6,27 @@
 
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
-module PPrint (pprint, pprintEsc, addErrSrc, printLitBlock) where
+module PPrint (pprint, pprintList,
+               assertEq, ignoreExcept, printLitBlock, asStr) where
 
+import Control.Monad.Except hiding (Except)
+import GHC.Float
 import Data.Text.Prettyprint.Doc.Render.Text
 import Data.Text.Prettyprint.Doc
 import Data.Text (unpack)
+import System.Console.ANSI
 
-import Record
 import Env
 import Syntax
-import Util (findReplace, highlightRegion)
 
 pprint :: Pretty a => a -> String
 pprint x = asStr $ pretty x
 
-pprintEsc :: Pretty a => a -> String
-pprintEsc x = findReplace "; ..\n" "\n" $ findReplace "\n" " ..\n" $ pprint x
+pprintList :: Pretty a => [a] -> String
+pprintList xs = asStr $ vsep $ punctuate "," (map p xs)
 
 asStr :: Doc ann -> String
 asStr doc = unpack $ renderStrict $ layoutPretty defaultLayoutOptions $ doc
@@ -41,43 +44,73 @@ instance Pretty ErrType where
     NoErr             -> ""
     ParseErr          -> "Parse error:"
     TypeErr           -> "Type error:"
-    CompilerErr       -> "Compiler bug!"
-    UnboundVarErr     -> "Variable not in scope:"
-    RepeatedVarErr    -> "Variable redefined:"
+    KindErr           -> "Kind error:"
+    LinErr            -> "Linearity error: "
+    UnboundVarErr     -> "Error: variable not in scope: "
+    RepeatedVarErr    -> "Error: variable already defined: "
     NotImplementedErr -> "Not implemented:"
-    OtherErr          -> "Error:"
-    UpstreamErr       -> "Upstream failure"
+    CompilerErr       ->
+      "Compiler bug!" <> line <>
+      "Please report this at github.com/google-research/dex-lang/issues\n" <> line
+    DataIOErr         -> "IO error: "
+    MiscErr           -> "Error:"
 
 instance Pretty Type where
-  pretty t = prettyTyDepth 0 t
+  pretty ty = case ty of
+    TypeVar v   -> p v
+    ArrowType l (Pi a (eff, b))
+      | isPure eff -> parens $ p a <+> arrStr l <+>           p b
+      | otherwise  -> parens $ p a <+> arrStr l <+> p eff <+> p b
+    Forall bs qs body -> header <+> p body
+      where
+        header = "A" <+> hsep (map p bs) <> qual <> "."
+        qual = case qs of
+                 [] -> mempty
+                 _  -> " |" <+> hsep (punctuate "," (map p qs))
+    TypeAlias _ _ -> "<type alias>"  -- TODO
+    Effect row t -> "{" <> row' <+> tailVar <> "}"
+      where
+        row' = hsep $ punctuate "," $
+                 [(p eff <+> p v) | (v, (eff,_)) <- envPairs row]
+        tailVar = case t of Nothing -> mempty
+                            Just v  -> "|" <+> p v
+    NoAnn  -> ""
+    TC con -> p con
+    where
+      arrStr :: Type -> Doc ann
+      arrStr Lin = "--o"
+      arrStr _        = "->"
 
-prettyTyDepth :: Int -> Type -> Doc ann
-prettyTyDepth d ty = case ty of
-  BaseType b  -> p b
-  TypeVar v   -> p v
-  BoundTVar n -> p (tvars d n)
-  ArrType a b -> parens $ recur a <+> "->" <+> recur b
-  TabType a b -> parens $ recur a <> "=>" <> recur b
-  RecType r   -> p $ fmap (asStr . recur) r
-  Exists body -> parens $ "E" <> p (tvars d (-1)) <> "." <> recurWith 1 body
-  IdxSetLit i -> p i
-  where recur = prettyTyDepth d
-        recurWith n = prettyTyDepth (d + n)
+instance Pretty ty => Pretty (TyCon ty Atom) where
+  pretty con = case con of
+    BaseType b  -> p b
+    TabType a b -> parens $ p a <> "=>" <> p b
+    RecType r   -> p $ fmap (asStr . p) r
+    RefType t   -> "Ref" <+> p t
+    TypeApp f xs -> p f <+> hsep (map p xs)
+    ArrayType shape b -> p b <> p shape
+    -- This rule forces us to specialize to Atom. Is there a better way?
+    IntRange (IntVal 0) (IntVal n) -> p n
+    IntRange a b -> p a <> "...<" <> p b
+    IndexRange _ low high -> low' <> "." <> high'
+      where
+        low'  = case low  of InclusiveLim x -> p x <> "."
+                             ExclusiveLim x -> p x <> "<"
+                             Unlimited      ->        "."
+        high' = case high of InclusiveLim x -> "." <> p x
+                             ExclusiveLim x -> "<" <> p x
+                             Unlimited      -> "."
+    LinCon    -> "Lin"
+    NonLinCon -> "NonLin"
 
-instance Pretty SigmaType where
-  pretty (Forall []    t) = prettyTyDepth 0 t
-  pretty (Forall kinds t) = header <+> prettyTyDepth n t
-    where n = length kinds
-          header = "A" <+> hsep boundvars <> "."
-          boundvars = map (p . tvars 0) [-n..(-1)]
+instance Pretty PiType where
+  pretty (Pi a b) = "Pi" <+> p a <+> p b
 
-tvars :: Int -> Int -> String
-tvars d i = case d - i - 1 of i' | i' >= 0 -> [['a'..'z'] !! i']
-                                 | otherwise -> "#ERR#"
+instance Pretty EffectName where
+  pretty x = p (show x)
 
-instance Pretty Kind where
---  pretty IdxSetKind = "R"
-  pretty TyKind = "T"
+instance Pretty TyQual where
+  pretty (TyQual v c) = p c <+> p v
 
 instance Pretty BaseType where
   pretty t = case t of
@@ -86,103 +119,124 @@ instance Pretty BaseType where
     RealType -> "Real"
     StrType  -> "Str"
 
+printDouble :: Double -> Doc ann
+printDouble x = p (double2Float x)
+
 instance Pretty LitVal where
   pretty (IntLit x ) = p x
-  pretty (RealLit x) = p x
+  pretty (RealLit x) = printDouble x
   pretty (StrLit x ) = p x
   pretty (BoolLit b) = if b then "True" else "False"
 
-instance Pretty b => Pretty (ExprP b) where
+instance Pretty Expr where
+  pretty (Decl decl body) = p decl <> hardline <> p body
+  pretty (CExpr expr) = p (OpExpr expr)
+  pretty (Atom atom) = p atom
+
+instance Pretty FExpr where
   pretty expr = case expr of
-    Lit val -> p val
-    Var v ts -> foldl (<+>) (p v) ["@" <> p t | t <- ts]
-    PrimOp b ts xs -> parens $ p b <> targs <> args
-      where targs = case ts of [] -> mempty; _ -> list   (map p ts)
-            args  = case xs of [] -> mempty; _ -> tupled (map p xs)
-    Decl decl body -> prettyDecl decl body
-    Lam pat e    -> parens $ align $ group $ "lam" <+> p pat <+> "." <> line <> align (p e)
-    App e1 e2    -> align $ parens $ group $ p e1 <+> p e2
-    For b e      -> parens $ "for " <+> p b <+> "." <> nest 4 (hardline <> p e)
-    Get e ie     -> p e <> "." <> p ie
-    RecCon r     -> p r
-    TabCon _ xs -> list (map pretty xs)
-    Pack e ty exTy -> "pack" <+> p e <> "," <+> p ty <> "," <+> p exTy
-    IdxLit _ i -> p i
+    FVar (v:>_) -> p v
+    FDecl decl body -> p decl <> hardline <> p body
+    FPrimExpr (OpExpr  e) -> parens $ p e
+    FPrimExpr (ConExpr e) -> p e
     SrcAnnot subexpr _ -> p subexpr
-    DerivAnnot e ann -> p e <+> "@deriv" <+> p ann
-    Annot subexpr ty -> p subexpr <+> "::" <+> p ty
+    Annot subexpr ty -> p subexpr <+> ":" <+> p ty
 
-prettyDecl :: (Pretty decl, Pretty body) => decl -> body -> Doc ann
-prettyDecl decl body = align $ "(" <> p decl <> ";" <> line <> p body <> ")"
-
-instance Pretty Ann where
-  pretty NoAnn = ""
-  pretty (Ann ty) = pretty ty
-
-instance Pretty a => Pretty (BinderP a) where
-  pretty (v :> ann) =
-    case asStr ann' of "" -> p v
-                       _  -> p v <> "::" <> ann'
-    where ann' = p ann
-
-instance Pretty b => Pretty (DeclP b) where
+instance Pretty FDecl where
   -- TODO: special-case annotated leaf var (print type on own line)
   pretty (LetMono pat expr) = p pat <+> "=" <+> p expr
-  pretty (LetPoly (v:>ty) (TLam tbs body)) =
-    p v <+> "::" <+> list (map p tbs) <> "." <+> p ty <> line <>
+  pretty (LetPoly (v:>ty) (FTLam _ _ body)) =
+    p v <+> ":" <+> p ty <> line <>
     p v <+> "="  <+> p body
-  pretty (TAlias v ty) = "type" <+> p v <+> "=" <+> p ty
-  pretty (Unpack b tv expr) = p b <> "," <+> p tv <+> "= unpack" <+> p expr
+  pretty (FRuleDef _ _ _) = "<TODO: rule def>"
+  pretty (TyDef v ty) = "type" <+> p v <+> "=" <+> p ty
 
-instance Pretty b => Pretty (TLamP b) where
-  pretty (TLam binders body) = "Lam" <+> p binders <> "." <+> align (p body)
+instance (Pretty ty, Pretty e, PrettyLam lam) => Pretty (PrimExpr ty e lam) where
+  pretty (OpExpr  op ) = p op
+  pretty (ConExpr con) = p con
 
-instance Pretty b => Pretty (TopDeclP b) where
-  pretty (TopDecl decl) = p decl
-  pretty (EvalCmd _ ) = error $ "EvalCmd not implemented" -- TODO
+instance (Pretty ty, Pretty e, PrettyLam lam) => Pretty (PrimOp ty e lam) where
+  pretty (App _ e1 e2) = p e1 <+> p e2
+  pretty (TApp e ts) = p e <+> hsep (map (\t -> "@" <> p t) ts)
+  pretty (For d lam) = dirStr d <+> i <+> "." <+> nest 3 (line <> body)
+    where (i, body) = prettyLam lam
+  pretty (TabCon _ _ xs) = list (map pretty xs)
+  pretty (TabGet   x i) = p x <> "." <> p i
+  pretty (RecGet   x i) = p x <> "#" <> p i
+  pretty (ArrayGep x i) = p x <> "." <> p i
+  pretty (LoadScalar x) = "load(" <> p x <> ")"
+  pretty (Cmp cmpOp _ x y) = "%cmp" <> p (show cmpOp) <+> p x <+> p y
+  pretty (Select ty b x y) = "%select @" <> p ty <+> p b <+> p x <+> p y
+  pretty (FFICall s _ _ xs) = "%%" <> p s <> tup xs
+  pretty op = prettyExprDefault (OpExpr op)
 
-instance Pretty Builtin where
-  pretty b = p (show b)
+instance (Pretty ty, Pretty e, PrettyLam lam) => Pretty (PrimCon ty e lam) where
+  pretty (Lit l)       = p l
+  pretty (Lam _ _ lam) = parens $ prettyL lam
+  pretty (RecCon r)    = p r
+  pretty (AFor n body) = parens $ "afor *:" <> p n <+> "." <+> p body
+  pretty (AGet e)      = "aget" <+> p e
+  pretty (AsIdx n i)   = p i <> "@" <> p n
+  pretty (ArrayRef array) = p array
+  pretty con = prettyExprDefault (ConExpr con)
 
-instance Pretty NExpr where
-  pretty expr = case expr of
-    NDecl decl body -> prettyDecl decl body
-    NScan b [] [] body -> parens $ "for " <+> p b <+> "." <+> nest 4 (hardline <> p body)
-    NScan b bs xs body -> parens $ "forM " <+> p b <+> hsep (map p bs) <+> "."
-                            <+> hsep (map p xs) <> ","
-                            <+> nest 4 (hardline <> p body)
-    NPrimOp b ts xs -> parens $ p b <> targs <> args
-      where targs = case ts of [] -> mempty; _ -> list   (map p ts)
-            args  = case xs of [] -> mempty; _ -> tupled (map p xs)
-    NApp f xs -> align $ group $ p f <+> hsep (map p xs)
-    NAtoms xs -> tup xs
-    NTabCon _ _ xs -> list (map pretty xs)
+prettyExprDefault :: (Pretty e, PrettyLam lam) => PrimExpr ty e lam -> Doc ann
+prettyExprDefault expr =
+  p ("%" ++ nameToStr blankExpr) <+> hsep (map p xs ++ map prettyL lams)
+  where (blankExpr, (_, xs, lams)) = unzipExpr expr
 
-instance Pretty NDecl where
+prettyL :: PrettyLam a => a -> Doc ann
+prettyL lam = "\\" <> v <+> "." <> nest 3 (line <> body)
+  where (v, body) = prettyLam lam
+
+class PrettyLam a where
+  prettyLam :: a -> (Doc ann, Doc ann)
+
+instance PrettyLam LamExpr where
+  prettyLam (LamExpr b e) = (p b, p e)
+
+instance PrettyLam FLamExpr where
+  prettyLam (FLamExpr pat e) = (p pat, p e)
+
+instance PrettyLam () where
+  prettyLam () = ("", "")
+
+instance (Pretty a, Pretty b) => PrettyLam (a, b) where
+  prettyLam (x, y) = (p x, p y)
+
+instance PrettyLam PiType where
+  prettyLam (Pi a (eff,b)) = (p a, p eff <+> p b)
+
+instance Pretty Kind where
+  pretty TyKind      = "Type"
+  pretty MultKind    = "Mult"
+  pretty EffectKind  = "Effect"
+  pretty k = p $ show k
+
+instance Pretty a => Pretty (VarP a) where
+  pretty (v :> ann) =
+    case asStr ann' of
+      ""     -> p v
+      "Type" -> p v
+      _      -> p v <> ":" <> ann'
+    where ann' = p ann
+
+instance Pretty ClassName where
+  pretty name = case name of
+    Data   -> "Data"
+    VSpace -> "VS"
+    IdxSet -> "Ix"
+
+instance Pretty Decl where
   pretty decl = case decl of
-    NLet bs bound   -> tup bs <+> "=" <+> p bound
-    NUnpack bs tv e -> tup bs <> "," <+> p tv <+> "= unpack" <+> p e
+    Let (NoName:>_) bound -> p (OpExpr bound)
+    Let b bound -> p b <+> "=" <+> p (OpExpr bound)
 
-instance Pretty NAtom where
+instance Pretty Atom where
   pretty atom = case atom of
-    NLit v -> p v
-    NVar x -> p x
-    NGet e i -> p e <> "." <> p i
-    NLam bs body -> parens $ align $ group $ "lam" <+> hsep (map p bs) <+> "."
-                     <> line <> align (p body)
-    NAtomicFor b e -> parens $ "afor " <+> p b <+> "." <+> nest 4 (hardline <> p e)
-    NDerivAnnot f df -> parens $ "derivAnnot" <+> parens (p f) <+> parens (p df)
-    NDeriv f -> parens $ "%Deriv" <+> p f
-
-instance Pretty NType where
-  pretty ty = case ty of
-    NBaseType b  -> p b
-    NTypeVar v   -> p v
-    NBoundTVar n -> "BV" <> p n  -- TODO: invent some variable names
-    NArrType as bs -> parens $ tup as <+> "->" <+> tup bs
-    NTabType a  b  -> p a <> "=>" <> p b
-    NExists tys -> "E" <> "." <> list (map p tys)
-    NIdxSetLit i -> p i
+    Var (x:>_)  -> p x
+    TLam vs qs body -> "tlam" <+> p vs <+> "|" <+> p qs <+> "." <+> p body
+    Con con -> p (ConExpr con)
 
 tup :: Pretty a => [a] -> Doc ann
 tup [x] = p x
@@ -190,88 +244,116 @@ tup xs  = tupled $ map p xs
 
 instance Pretty IExpr where
   pretty (ILit v) = p v
-  pretty (IVar v) = p v
-  pretty (IGet expr idx) = p expr <> "." <> p idx
+  pretty (IVar (v:>_)) = p v
+  pretty (IRef ref) = p ref
 
 instance Pretty IType where
-  pretty (IType ty shape) = p ty <> p shape
+  pretty (IRefType (ty, shape)) = "Ptr (" <> p ty <> p shape <> ")"
+  pretty (IValType b) = p b
 
 instance Pretty ImpProg where
-  pretty (ImpProg block) = vcat (map p block)
+  pretty (ImpProg block) = vcat (map prettyStatement block)
 
-instance Pretty Statement where
-  pretty (Alloc b body) = p b <> braces (hardline <> p body)
-  pretty (Update v idxs b _ exprs) = p v <> p idxs <+>
-                                       ":=" <+> p b <+> hsep (map p exprs)
-  pretty (Loop i n block) = "for" <+> p i <+> "<" <+> p n <>
-                               nest 4 (hardline <> p block)
+prettyStatement :: (Maybe IVar, ImpInstr) -> Doc ann
+prettyStatement (Nothing, instr) = p instr
+prettyStatement (Just b , instr) = p b <+> "=" <+> p instr
 
-instance Pretty Value where
-  pretty (Value (BaseType IntType ) (RecLeaf (IntVec  [v]))) = p v
-  pretty (Value (BaseType RealType) (RecLeaf (RealVec [v]))) = p v
-  pretty (Value (BaseType BoolType ) (RecLeaf (IntVec  [v]))) | mod v 2 == 0 = "False"
-                                                              | mod v 2 == 1 = "True"
-  pretty (Value (RecType r) (RecTree r')) = p (recZipWith Value r r')
-  pretty (Value (TabType n ty) v) = list $ map p (splitTab n ty v)
-  pretty v = error $ "Can't print: " ++ show v
+instance Pretty ImpInstr where
+  pretty (IPrimOp op)       = p op
+  pretty (Load ref)         = "load"  <+> p ref
+  pretty (Store dest val)   = "store" <+> p dest <+> p val
+  pretty (Copy dest source) = "copy"  <+> p dest <+> p source
+  pretty (Alloc ty)         = "alloc" <+> p ty
+  pretty (IGet expr idx)    = p expr <> "." <> p idx
+  pretty (Free (v:>_))      = "free"  <+> p v
+  pretty (Loop d i n block) = dirStr d <+> p i <+> "<" <+> p n <>
+                              nest 4 (hardline <> p block)
 
-splitTab :: IdxSet -> Type -> RecTree Vec -> [Value]
-splitTab (IdxSetLit n) ty v = map (Value ty) $ transposeRecTree (fmap splitVec v)
-  where
-    splitVec :: Vec -> [Vec]
-    splitVec (IntVec  xs) = map IntVec  $ chunk (length xs `div` n) xs
-    splitVec (RealVec xs) = map RealVec $ chunk (length xs `div` n) xs
+dirStr :: Direction -> Doc ann
+dirStr Fwd = "for"
+dirStr Rev = " rof"
 
-    -- TODO: this is O(N^2)
-    transposeRecTree :: RecTree [a] -> [RecTree a]
-    transposeRecTree tree = [fmap (!!i) tree | i <- [0..n-1]]
-
-    chunk :: Int -> [a] -> [[a]]
-    chunk _ [] = []
-    chunk m xs = take m xs : chunk m (drop m xs)
-splitTab _ _ _ = error $ "Not implemented" -- TODO
-
-instance Pretty Vec where
-  pretty (IntVec  xs) = p xs
-  pretty (RealVec xs) = p xs
+instance Pretty Array where
+  pretty (Array shape b _) = "ArrayLit(" <> p b <> p shape <> ")"
 
 instance Pretty a => Pretty (SetVal a) where
   pretty NotSet = ""
   pretty (Set a) = p a
 
-instance Pretty Output where
-  pretty (ValOut Printed val) = p val
-  pretty (ValOut _ _) = "<graphical output>"
-  pretty (TextOut s) = p s
-  pretty NoOutput = ""
-
 instance (Pretty a, Pretty b) => Pretty (LorT a b) where
   pretty (L x) = "L" <+> p x
   pretty (T x) = "T" <+> p x
 
+instance Pretty Output where
+  pretty (TextOut   s) = pretty s
+  pretty (HeatmapOut _ _ _) = "<graphical output>"
+  pretty (ScatterOut _ _  ) = "<graphical output>"
+  pretty (PassInfo name t s) = "===" <+> p name <+> "===" <> hardline <> p s <> t'
+    where t' = case t of "" -> ""
+                         _  -> hardline <> "time:" <+> p t
+
+instance Pretty PassName where
+  pretty x = p $ show x
+
 instance Pretty SourceBlock where
-  pretty block = p (sbText block)
+  pretty block = pretty (sbText block)
 
 instance Pretty Result where
-  pretty (Result r) = case r of
-    Left err -> p err
-    Right NoOutput -> mempty
-    Right out -> p out
+  pretty (Result outs r) = vcat (map pretty outs) <> maybeErr
+    where maybeErr = case r of Left err -> p err
+                               Right () -> mempty
 
-printLitBlock :: SourceBlock -> Result -> String
-printLitBlock block result = pprint block ++ resultStr
-  where
-    resultStr = unlines $ map addPrefix $ lines $ pprint result
-    addPrefix :: String -> String
-    addPrefix s = case s of "" -> ">"
-                            _  -> "> " ++ s
+instance Pretty TopEnv where
+  pretty (TopEnv _ subEnv _) = p subEnv
 
--- TODO: add line numbers back (makes the quines a little brittle)
-addErrSrc :: SourceBlock -> Result -> Result
-addErrSrc block result = case result of
-  Result (Left (Err e (Just (start, stop)) s')) ->
-    Result $ Left $ Err e Nothing $ s' ++ "\n\n" ++ ctx
-      where
-        n = sbOffset block
-        ctx = highlightRegion (start - n, stop - n) (sbText block)
-  _ -> result
+instance Pretty body => Pretty (ModuleP body) where
+  pretty (Module (imports, exports) body) = "imports:" <+> p imports
+                             <> hardline <> p body
+                             <> hardline <> "exports:" <+> p exports
+
+instance Pretty FModBody where
+  pretty (FModBody decls tyDefs) = vsep (map p decls) <> hardline <> p tyDefs
+
+instance Pretty ModBody where
+  pretty (ModBody decls result) =
+    vsep (map p decls) <> hardline <> "result:" <+> p result
+
+instance Pretty ImpModBody where
+  pretty (ImpModBody vs prog result) =
+    p vs <> hardline <> p prog <> hardline <> p result
+
+instance (Pretty a, Pretty b) => Pretty (Either a b) where
+  pretty (Left  x) = "Left"  <+> p x
+  pretty (Right x) = "Right" <+> p x
+
+printLitBlock :: Bool -> SourceBlock -> Result -> String
+printLitBlock isatty block (Result outs result) =
+  pprint block ++ concat (map (printOutput isatty) outs) ++ printResult isatty result
+
+printOutput :: Bool -> Output -> String
+printOutput isatty out = addPrefix (addColor isatty Cyan ">") $ pprint $ out
+
+printResult :: Bool -> Except () -> String
+printResult _ (Right ()) = ""
+printResult isatty (Left err) = addColor isatty Red $ addPrefix ">" $ pprint err
+
+addPrefix :: String -> String -> String
+addPrefix prefix str = unlines $ map prefixLine $ lines str
+  where prefixLine :: String -> String
+        prefixLine s = case s of "" -> prefix
+                                 _  -> prefix ++ " " ++ s
+
+addColor :: Bool -> Color -> String -> String
+addColor False _ s = s
+addColor True c s =
+  setSGRCode [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid c]
+  ++ s ++ setSGRCode [Reset]
+
+assertEq :: (MonadError Err m, Pretty a, Eq a) => a -> a -> String -> m ()
+assertEq x y s = if x == y then return ()
+                           else throw CompilerErr msg
+  where msg = s ++ ": " ++ pprint x ++ " != " ++ pprint y ++ "\n"
+
+ignoreExcept :: Except a -> a
+ignoreExcept (Left e) = error $ pprint e
+ignoreExcept (Right x) = x

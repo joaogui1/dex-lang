@@ -6,13 +6,17 @@
 
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
 
-module Interpreter (interpPass, Subst, subst) where
+module Interpreter (interpPass) where
 
-import Control.Monad.Reader
 import Data.Foldable (fold, toList)
 import Data.List (mapAccumL)
 import Data.Void
+import Control.Monad.State
+import Control.Monad.Reader
+import Control.Monad.Identity
+import qualified Data.Map.Strict as M
 
 import Syntax
 import Env
@@ -21,7 +25,9 @@ import PPrint
 import Cat
 import Record
 import Type
+import Subst
 import Fresh
+import Util
 
 -- TODO: can we make this as dynamic as the compiled version?
 foreign import ccall "sqrt" c_sqrt :: Double -> Double
@@ -30,80 +36,71 @@ foreign import ccall "cos"  c_cos  :: Double -> Double
 foreign import ccall "tan"  c_tan  :: Double -> Double
 foreign import ccall "exp"  c_exp  :: Double -> Double
 foreign import ccall "log"  c_log  :: Double -> Double
+foreign import ccall "pow"  c_pow  :: Double -> Double -> Double
 foreign import ccall "randunif"      c_unif     :: Int -> Double
 foreign import ccall "threefry2x32"  c_threefry :: Int -> Int -> Int
 
-type Val = Expr -- irreducible expressions only
-type Scope = Env ()
+type ClosedExpr = Expr -- no free variables
 type SubstEnv = (FullEnv (Either Name TLam) Type, Scope)
-type ReduceM a = Reader SubstEnv a
 
 interpPass :: TopPass TopDecl Void
 interpPass = TopPass interpPass'
 
-interpPass' :: TopDecl -> TopPassM SubstEnv Void
+interpPass' :: TopDecl -> TopPassM SubstEnv [Void]
 interpPass' topDecl = case topDecl of
-  TopDecl decl -> do
+  TopDecl _ decl -> do
     env <- look
-    extend $ runReader (reduceDecl decl) env
+    extend $ reduceDecl $ subst env decl
     emitOutput NoOutput
   EvalCmd (Command (EvalExpr Printed) expr) -> do
     env <- look
-    emitOutput $ TextOut $ pprint $ runReader (reduce expr) env
+    emitOutput $ TextOut $ pprint $ reduce $ subst env expr
   _ -> emitOutput NoOutput
 
-reduce :: Expr -> ReduceM Val
+reduce :: ClosedExpr -> Val
 reduce expr = case expr of
-  Lit _ -> subst expr
-  Var _ _ -> do
-    expr' <- subst expr
-    dropSubst $ reduce expr'
-  PrimOp Scan _ [x, fs] -> do
-    x' <- reduce x
-    ~(RecType (Tup [_, ty@(TabType n _)])) <- exprType expr
-    fs' <- subst fs
-    scope <- asks snd
-    let (carry, ys) = mapAccumL (evalScanBody scope fs') x' (enumerateIdxs n)
-    return $ RecCon $ Tup [carry, TabCon ty ys]
-  PrimOp op ts xs -> do
-    ts' <- mapM subst ts
-    xs' <- mapM reduce xs
-    return $ evalOp op ts' xs'
-  Decl decl body -> do
-    env' <- reduceDecl decl
-    extendR env' $ reduce body
-  Lam _ _ -> subst expr
-  App e1 e2 -> do
-    ~(Lam p body) <- reduce e1
-    x <- reduce e2
-    dropSubst $ extendR (bindPat p x) (reduce body)
-  For p body -> do
-    ~(ty@(TabType n _)) <- exprType expr
-    xs <- flip traverse (enumerateIdxs n) $ \i ->
-            extendR (bindPat p i) (reduce body)
-    return $ TabCon ty xs
-  Get e i -> liftM2 idxTabCon (reduce e) (reduce i)
-  RecCon r -> liftM RecCon (traverse reduce r)
-  TabCon ty xs -> liftM2 TabCon (subst ty) (mapM reduce xs)
-  Pack e ty exTy -> liftM3 Pack (reduce e) (subst ty) (subst exTy)
-  IdxLit _ _ -> subst expr
+  Lit _ -> expr
+  Var _ _ _ -> error $ "Can only reduce closed expression. Got: " ++ pprint expr
+  PrimOp Scan _ [x, fs] -> RecCon Cart $ Tup [carry, TabCon ty ys]
+    where
+      x'  = reduce x
+      (RecType _ (Tup [_, ty@(TabType n _)])) = getType expr
+      (carry, ys) = mapAccumL (evalScanBody fs) x' (enumerateIdxs n)
+  PrimOp op ts xs -> evalOp op ts (map reduce xs)
+  Decl decl body  -> subReduce (reduceDecl decl) body
+  Lam _ _ _ -> expr
+  App e1 e2 -> case reduce e1 of
+    Lam _ p body ->
+      subReduce (bindPat p e2') body
+    PrimOp Transpose _ ~[Lam _ (RecLeaf b) body] ->
+      fst $ sepCotangent b (transpose e2' body)
+    e1' -> error $ "unexpected function: " ++ pprint e1'
+    where e2' = reduce e2
+  For p body -> TabCon ty xs
+    where
+      (ty@(TabType n _)) = getType expr
+      xs = map (\i -> subReduce (bindPat p i) body) (enumerateIdxs n)
+  Get e i        -> idxTabCon (reduce e) (reduce i)
+  RecCon k r     -> RecCon k (fmap reduce r)
+  TabCon ty xs   -> TabCon ty (map reduce xs)
+  Pack e ty exTy -> Pack (reduce e) ty exTy
+  IdxLit _ _ -> expr
   _ -> error $ "Can't evaluate in interpreter: " ++ pprint expr
 
-exprType :: Expr -> ReduceM Type
-exprType expr = do expr' <- subst expr
-                   return $ getType mempty expr'
+subReduce :: SubstEnv -> Expr -> Val
+subReduce env expr = reduce (subst env expr)
 
-evalScanBody :: Scope -> Expr -> Val -> Val -> (Val, Val)
-evalScanBody scope (For ip (Lam p body)) accum i =
-  case runReader (reduce body) env of
-    RecCon (Tup [accum', ys]) -> (accum', ys)
+evalScanBody :: Expr -> Val -> Val -> (Val, Val)
+evalScanBody (For ip (Lam _ p body)) accum i =
+  case subReduce env body of
+    RecCon _ (Tup [accum', ys]) -> (accum', ys)
     val -> error $ "unexpected scan result: " ++ pprint val
-  where env =  bindPat ip i <> bindPat p accum <> asSnd scope
-evalScanBody _ e _ _ = error $ "Bad scan argument: " ++ pprint e
+  where env =  bindPat ip i <> bindPat p accum
+evalScanBody e _ _ = error $ "Bad scan argument: " ++ pprint e
 
 enumerateIdxs :: Type -> [Val]
 enumerateIdxs (IdxSetLit n) = map (IdxLit n) [0..n-1]
-enumerateIdxs (RecType r) = map RecCon $ traverse enumerateIdxs r  -- list monad
+enumerateIdxs (RecType k r) = map (RecCon k) $ traverse enumerateIdxs r  -- list monad
 enumerateIdxs ty = error $ "Not an index type: " ++ pprint ty
 
 idxTabCon :: Val -> Val -> Val
@@ -119,47 +116,54 @@ intToIdx ty i = idxs !! (i `mod` length idxs)
 
 flattenIdx :: Val -> (Int, Int)
 flattenIdx (IdxLit n i) = (n, i)
-flattenIdx (RecCon r) = foldr f (1,0) $ map flattenIdx (toList r)
+flattenIdx (RecCon _ r) = foldr f (1,0) $ map flattenIdx (toList r)
   where f (size, idx) (cumSize, cumIdx) = (cumSize * size, cumIdx + idx * cumSize)
 flattenIdx v = error $ "Not a valid index: " ++ pprint v
 
-reduceDecl :: Decl -> ReduceM SubstEnv
-reduceDecl (LetMono p expr) = do
-  val <- reduce expr
-  return $ bindPat p val
-reduceDecl (LetPoly (v:>_) tlam) = do
-  tlam' <- subst tlam
-  return $ asFst $ v @> L (Right tlam')
-reduceDecl (Unpack (v:>_) tv expr) = do
-  ~(Pack val ty _) <- reduce expr
-  return $ asFst $ v @> L (Right (TLam [] val)) <> tv @> T ty
-reduceDecl (TAlias _ _ ) = error "Shouldn't have TAlias left"
+reduceDecl :: Decl -> SubstEnv
+reduceDecl (LetMono p expr) = bindPat p (reduce expr)
+reduceDecl (LetPoly (v:>_) tlam) = asFst $ v @> L (Right tlam)
+reduceDecl (Unpack (v:>_) tv expr) =
+  asFst $ v @> L (Right (TLam [] val)) <> tv @> T ty
+  where (Pack val ty _) = reduce expr
+-- TODO: handle parametric type aliases
+reduceDecl (TyDef _ v _ ty) = asFst $ v @> T ty
+reduceDecl (DoBind _ _) = error "Not implemented"
 
 bindPat :: Pat -> Val -> SubstEnv
 bindPat (RecLeaf (v:>_)) val = asFst $ v @> L (Right (TLam [] val))
-bindPat (RecTree r) (RecCon r') = fold $ recZipWith bindPat r r'
+bindPat (RecTree r) (RecCon _ r') = fold $ recZipWith bindPat r r'
 bindPat _ _ = error "Bad pattern"
 
 evalOp :: Builtin -> [Type] -> [Val] -> Val
 evalOp IAdd _ xs = intBinOp (+) xs
 evalOp ISub _ xs = intBinOp (-) xs
 evalOp IMul _ xs = intBinOp (*) xs
-evalOp Mod  _ xs = intBinOp mod xs
+evalOp Rem  _ xs = intBinOp rem xs
 evalOp FAdd _ xs = realBinOp (+) xs
 evalOp FSub _ xs = realBinOp (-) xs
 evalOp FMul _ xs = realBinOp (*) xs
 evalOp FDiv _ xs = realBinOp (/) xs
+evalOp FNeg _ ~[Lit (RealLit x)] = Lit $ RealLit $ - x
 evalOp BoolToInt _ ~[Lit (BoolLit x)] = Lit $ IntLit (if x then 1 else 0)
-evalOp FLT _ ~[x, y] = Lit $ BoolLit $ fromRealLit x < fromRealLit y
-evalOp FGT _ ~[x, y] = Lit $ BoolLit $ fromRealLit x > fromRealLit y
-evalOp ILT _ ~[x, y] = Lit $ BoolLit $ fromIntLit  x < fromIntLit  y
-evalOp IGT _ ~[x, y] = Lit $ BoolLit $ fromIntLit  x > fromIntLit  y
+evalOp (Cmp cmp) [BaseType RealType] ~[x, y] = Lit $ BoolLit $ evalCmp cmp (fromRealLit x) (fromRealLit y)
+evalOp (Cmp cmp) [BaseType IntType ] ~[x, y] = Lit $ BoolLit $ evalCmp cmp (fromIntLit  x) (fromIntLit  y)
+evalOp (Cmp cmp) [IdxSetLit _      ] ~[x, y] = Lit $ BoolLit $ evalCmp cmp (idxToInt    x) (idxToInt    y)
+
+evalOp And _ ~[Lit (BoolLit x),  Lit (BoolLit y)] = Lit $ BoolLit $ x && y
+evalOp Or  _ ~[Lit (BoolLit x),  Lit (BoolLit y)] = Lit $ BoolLit $ x || y
+evalOp Not _ ~[Lit (BoolLit x)]                   = Lit $ BoolLit $ not x
 evalOp Range _ ~[x] = Pack unitCon (IdxSetLit (fromIntLit x)) (Exists unitTy)
+evalOp Select _ ~[Lit (BoolLit p), x, y] = if p then x else y
 evalOp IndexAsInt _ ~[x] = Lit (IntLit (idxToInt x))
 evalOp IntAsIndex ~[ty] ~[Lit (IntLit x)] = intToIdx ty x
+evalOp IdxSetSize ~[IdxSetLit n] _ = Lit $ IntLit n
 evalOp IntToReal _ ~[Lit (IntLit x)] = Lit (RealLit (fromIntegral x))
+evalOp NewtypeCast _ ~[x] = x
 evalOp Filter _  ~[f, TabCon (TabType _ ty) xs] =
   exTable ty $ filter (fromBoolLit . asFun f) xs
+evalOp Linearize _ ~[Lam _ (RecLeaf b) body, x] = runLinearize b body x
+evalOp Transpose tys xs = PrimOp Transpose tys xs
 evalOp (FFICall _ name) _ xs = case name of
   "sqrt" -> realUnOp c_sqrt xs
   "sin"  -> realUnOp c_sin  xs
@@ -167,6 +171,7 @@ evalOp (FFICall _ name) _ xs = case name of
   "tan"  -> realUnOp c_tan  xs
   "exp"  -> realUnOp c_exp  xs
   "log"  -> realUnOp c_log  xs
+  "pow"  -> realBinOp c_pow  xs
   "randunif"  -> case xs of [Lit (IntLit x)] -> Lit $ RealLit $ c_unif x
                             _ -> error "bad arg"
   "threefry2x32" -> intBinOp c_threefry xs
@@ -174,11 +179,18 @@ evalOp (FFICall _ name) _ xs = case name of
 evalOp op _ _ = error $ "Primop not implemented: " ++ pprint op
 
 asFun :: Val -> Val -> Val
-asFun f x = runReader (reduce (App f x)) mempty
+asFun f x = reduce (App f x)
 
 exTable :: Type -> [Expr] -> Expr
 exTable ty xs = Pack (TabCon ty xs) (IdxSetLit (length xs)) exTy
   where exTy = Exists $ TabType (BoundTVar 0) ty
+
+evalCmp :: Ord a => CmpOp -> a -> a -> Bool
+evalCmp Less    x y = x < y
+evalCmp LessEqual    x y = x <= y
+evalCmp Greater x y = x > y
+evalCmp GreaterEqual x y = x >= y
+evalCmp Equal   x y = x == y
 
 intBinOp :: (Int -> Int -> Int) -> [Val] -> Val
 intBinOp op [Lit (IntLit x), Lit (IntLit y)] = Lit $ IntLit $ op x y
@@ -204,111 +216,188 @@ fromBoolLit :: Val -> Bool
 fromBoolLit (Lit (BoolLit x)) = x
 fromBoolLit x = error $ "Not a bool lit: " ++ pprint x
 
-dropSubst :: MonadReader SubstEnv m => m a -> m a
-dropSubst m = do local (\(_, scope) -> (mempty, scope)) m
+-- === Linearization ===
 
-class Subst a where
-  subst :: MonadReader SubstEnv m => a -> m a
+type DVal = Val
+type DEnv = Env (Type, DVal)
+type DerivM a = ReaderT DEnv (CatT (Env Type, [Decl]) Identity) a
 
-instance Subst Expr where
-  subst expr = case expr of
-    Lit _ -> return expr
-    Var v tys -> do
-      tys' <- mapM subst tys
-      x <- asks $ flip envLookup v . fst
-      case x of
-        Nothing -> return $ Var v tys'
-        Just (L (Left v')) -> return $ Var v' tys'
-        Just (L (Right (TLam tbs body))) -> dropSubst $ extendR env (subst body)
-          where env = asFst $ fold [tv @> T t | (tv:>_, t) <- zip tbs tys']
-        Just (T _ ) -> error "Expected let-bound var"
-    PrimOp op ts xs -> liftM2 (PrimOp op) (mapM subst ts) (mapM subst xs)
-    Decl decl body -> case decl of
-      LetMono p bound -> do
-        bound' <- subst bound
-        refreshPat p $ \p' -> do
-          body' <- subst body
-          return $ Decl (LetMono p' bound') body'
-      LetPoly (v:>ty) tlam -> do
-        tlam' <- subst tlam
-        ty' <- subst ty
-        v' <- asks $ rename v . snd
-        body' <- extendR ((v @> L (Left v'), v' @> ())) (subst body)
-        return $ Decl (LetPoly (v':>ty') tlam') body'
-      Unpack b tv bound -> do
-        bound' <- subst bound
-        refreshTBinders [tv:>idxSetKind] $ \[tv':>_] ->
-          refreshPat [b] $ \[b'] -> do
-            body' <- subst body
-            return $ Decl (Unpack b' tv' bound') body'
-      TAlias _ _ -> error "Shouldn't have TAlias left"
-    Lam p body -> do
-      refreshPat p $ \p' -> do
-        body' <- subst body
-        return $ Lam p' body'
-    App e1 e2 -> liftM2 App (subst e1) (subst e2)
-    For p body -> do
-      refreshPat p $ \p' -> do
-        body' <- subst body
-        return $ For p' body'
-    Get e1 e2 -> liftM2 Get (subst e1) (subst e2)
-    RecCon r -> liftM RecCon (traverse subst r)
-    IdxLit _ _ -> return expr
-    TabCon ty xs -> liftM2 TabCon (subst ty) (mapM subst xs)
-    Pack e ty exTy -> liftM3 Pack (subst e) (subst ty) (subst exTy)
-    Annot e t -> liftM2 Annot (subst e) (subst t)
-    DerivAnnot e1 e2 -> liftM2 DerivAnnot (subst e1) (subst e2)
-    SrcAnnot e pos -> liftM (flip SrcAnnot pos) (subst e)
+runLinearize :: Binder -> Expr -> Val -> Val
+runLinearize (v:>ty) body x =
+  pair outPrimal $ Lam (Mult Lin) (RecLeaf (t:>ty)) $ wrapDecls decls outTangent
+  where
+    t = "t" :: Name
+    env = v @> (ty, makeDual ty x (Var t ty []))
+    outTy = getType body
+    (out, (_, decls)) =
+        runIdentity $ flip runCatT (t@>ty, []) $ flip runReaderT env $ linearize body
+    (outPrimal, outTangent) = fromDual outTy out
 
-instance Subst TLam where
-  subst (TLam tbs body) = refreshTBinders tbs $ \tbs' ->
-                            liftM (TLam tbs') (subst body)
+makeDual :: Type -> Val -> Expr -> DVal
+makeDual (BaseType RealType) x t = pair x t
+makeDual (RecType Cart tys) ~(RecCon _ rx) rt = RecCon Cart $ recZipWith f (recNameVals tys) rx
+  where f :: (RecField, Type) -> Val -> DVal
+        f (field, eltTy) x = makeDual eltTy x (getField tys rt field)
+makeDual ty@(TabType n bodyTy) xs t =
+  TabCon ty [makeDual bodyTy (idxTabCon xs i) (Get t i) | i <- enumerateIdxs n]
+makeDual ty _ _ = error $ "Can't make dual number for type: " ++ pprint ty
 
--- Might be able to de-dup these with explicit traversals, lens-style
-refreshPat :: (Traversable t, MonadReader SubstEnv m) =>
-                t Binder -> (t Binder -> m a) -> m a
-refreshPat p m = do
-  p' <- traverse (traverse subst) p
-  scope <- asks snd
-  let (p'', (env', scope')) =
-        flip runCat (mempty, scope) $ flip traverse p' $ \(v:>ty) -> do
-          v' <- freshCatSubst v
-          return (v':>ty)
-  extendR (fmap (L . Left) env', scope') $ m p''
+fromDual :: Type -> DVal -> (Val, Val)
+fromDual (BaseType RealType) ~(RecCon _ (Tup [x, t])) = (x, t)
+fromDual (RecType _ r) (RecCon _ xts) = (RecCon Cart (fmap fst xts'),
+                                         RecCon Cart (fmap snd xts'))
+  where xts' = recZipWith fromDual r xts
+fromDual ty@(TabType _ eltTy) (TabCon _ xts) = (TabCon ty (map fst xts'),
+                                                TabCon ty (map snd xts'))
+  where xts' = map (fromDual eltTy) xts
+fromDual ty _ = error $ "Not a valid type for duals: " ++ pprint ty
 
-refreshTBinders :: MonadReader SubstEnv m => [TBinder] -> ([TBinder] -> m a) -> m a
-refreshTBinders bs m = do
-  scope <- asks snd
-  let (bs', (env', scope')) =
-        flip runCat (mempty, scope) $ flip traverse bs $ \(v:>k) -> do
-          v' <- freshCatSubst v
-          return (v':>k)
-  extendR (fmap (T . TypeVar) env', scope') $ m bs'
+-- TODO: replace this with a proper embedding
+getField :: Record Type -> Expr -> RecField -> Expr
+getField tys expr field = Decl (LetMono p' expr) (Var v (patType p') [])
+  where v = "elt" :: Name
+        p = fmap (\ty -> RecLeaf ("_" :> ty)) tys
+        p' = RecTree $ recUpdate field (RecLeaf (v:> recGet tys field)) p
 
-instance Subst Type where
-  subst ty = case ty of
-    BaseType _ -> return ty
-    TypeVar v -> do
-      x <- asks $ flip envLookup v . fst
-      return $ case x of Nothing -> ty
-                         Just (T ty') -> ty'
-                         Just (L _) -> error "Expected type var"
-    ArrType a b -> liftM2 ArrType (subst a) (subst b)
-    TabType a b -> liftM2 TabType (subst a) (subst b)
-    RecType r -> liftM RecType $ traverse subst r
-    Exists body -> liftM Exists (subst body)
-    IdxSetLit _ -> return ty
-    BoundTVar _ -> return ty
+linearize :: Expr -> DerivM DVal
+linearize expr = case expr of
+  Lit _ -> return $ pair expr (zeroAt ty)
+    where ty = getType expr
+  Var v _ _ -> do
+    val <- asks $ flip envLookup v
+    case val of
+      Nothing -> error $ "Unexpected var: " ++ pprint v
+      Just (_, x)  -> return x
+  PrimOp op ts xs -> do
+    xs' <- mapM linearize xs
+    linearizePrimOp op ts xs'
+  Decl (LetMono p rhs) body -> do
+    rhs' <- linearize rhs
+    extendR (bindPatDeriv p rhs') (linearize body)
+  App e1 e2 -> do
+    e2' <- linearize e2
+    ~(Decl (LetMono p xs) (Lam _ p' body)) <- linearize e1
+    let env = bindPatDeriv p xs <> bindPatDeriv p' e2'
+    extendR env $ linearize body
+  For p body -> do
+    let (ty@(TabType n _)) = getType expr
+    xs <- mapM (\i -> linearize (subst (bindPat p i) body)) (enumerateIdxs n)
+    return $ TabCon ty xs
+  Get e i -> do
+    e' <- linearize e
+    return $ idxTabCon e' (reduce i)
+  Lam (Mult NonLin) _ _ -> do
+    env <- ask
+    return $ makeClosure env expr
+  RecCon k r -> liftM (RecCon k) (traverse linearize r)
+  _ -> error $ "Linearization not implemented for: " ++ pprint expr
 
-instance Subst SigmaType where
-  subst (Forall ks body) = liftM (Forall ks) (subst body)
+type Atom = Expr
 
-instance Subst Binder where
-  -- TODO: this only substitutes the type!
-  subst (v:>ty) = liftM (v:>) (subst ty)
+pair :: Val -> Val -> Val
+pair x y = RecCon Cart $ Tup [x, y]
 
-instance Subst Pat where
-  subst p = traverse subst p
+linearizePrimOp :: Builtin -> [Type] -> [DVal] -> DerivM DVal
+linearizePrimOp op ts xs | nLin == nArgs = do
+  tOut <- emit $ case prodKind of
+            Cart -> PrimOp op ts xsTangent
+            Tens -> sumAt outTy [PrimOp op ts (swapAt i t xsPrimal)
+                                | (i, t) <- zip [0..] xsTangent]
+  return $ pair pOut tOut
+  where
+    BuiltinType _ (nLin, prodKind) xTys outTy = builtinType op
+    nArgs = length xTys
+    xsPrimal  = map (fst . fromPair) xs
+    xsTangent = map (snd . fromPair) xs
+    pOut = reduce $ PrimOp op ts xsPrimal
+linearizePrimOp op _ _ = error $ "Linearization not implemented for " ++ pprint op
 
-instance (Subst a, Subst b) => Subst (a, b) where
-  subst (x, y) = liftM2 (,) (subst x) (subst y)
+emit :: Expr -> DerivM Atom
+emit expr = do
+  scope <- looks fst
+  let v = rename "t" scope
+  let ty = getType expr
+  extend (v@>ty, [LetMono (RecLeaf (v:>ty)) expr])
+  return $ Var v ty []
+
+makeClosure :: DEnv -> Expr -> Expr
+makeClosure env expr = Decl (LetMono p xs') expr
+  where
+    (vs, tysxs) = unzip $ envPairs $ envIntersect (freeVars expr) env
+    (tys, xs) = unzip tysxs
+    p = RecTree $ Tup $ [RecLeaf (v:>ty) | (v,ty) <- zip vs tys]
+    xs' = RecCon Cart $ Tup xs
+
+bindPatDeriv :: Pat -> Val -> DEnv
+bindPatDeriv (RecLeaf (v:>ty)) val = v @> (ty, val)
+bindPatDeriv (RecTree r) (RecCon _ r') = fold $ recZipWith bindPatDeriv r r'
+bindPatDeriv _ _ = error "Bad pattern"
+
+fromPair :: Expr -> (Expr, Expr)
+fromPair (RecCon _ (Tup [x, y])) = (x, y)
+fromPair expr = error $ "Not a pair: " ++ pprint expr
+
+-- === Transposition ===
+
+type CotangentVals = MonMap Name [Val]
+
+transpose :: Val -> Expr -> CotangentVals
+transpose ct expr = case expr of
+  Lit _ -> mempty
+  Var v _ _ -> MonMap $ M.singleton v [ct]
+  PrimOp op ts xs -> transposeOp op ct ts xs
+  Decl (LetMono p rhs) body
+    | hasFVs rhs -> cts <> transpose ct' rhs
+                      where (ct', cts) = sepCotangents p $ transpose ct body
+  App e1 e2
+    | hasFVs e2 -> cts <> transpose ct' e2
+                     where
+                       (Lam _ p body) = reduce e1
+                       (ct', cts) = sepCotangents p $ transpose ct body
+  RecCon Cart r -> fold $ recZipWith transpose r' r
+    where (RecCon _ r') = ct
+  _ -> error $ "Can't transpose in interpreter: " ++ pprint expr
+
+transposeOp :: Builtin -> Val -> [Type] -> [Val] -> CotangentVals
+transposeOp op ct ts xs = case (op, ts, xs) of
+  (FAdd, _, ~[x, y]) -> transpose ct x <> transpose ct y
+  (FMul, _, ~[x, y]) | hasFVs y  -> let ct' = mul ct (reduce x)
+                                    in transpose ct' y
+                     | otherwise -> let ct' = mul ct (reduce y)
+                                    in transpose ct' x
+  _ -> error $ "Transpose not implemented for " ++ pprint op
+
+hasFVs :: Expr -> Bool
+hasFVs expr = not $ null $ envNames $ freeVars expr
+
+sepCotangent :: Binder -> CotangentVals -> (Val, CotangentVals)
+sepCotangent (v:>ty) (MonMap m) = ( reduce $ sumAt ty $ M.findWithDefault [] v m
+                                  , MonMap (M.delete v m))
+
+sepCotangents :: Pat -> CotangentVals -> (Val, CotangentVals)
+sepCotangents p vs = (recTreeToVal tree, cts)
+  where (tree, cts) = flip runState vs $ flip traverse p $ \b -> do
+                        s <- get
+                        let (x, s') = sepCotangent b s
+                        put s'
+                        return x
+
+mul :: Val -> Val -> Val
+mul x y = realBinOp (*) [x, y]
+
+recTreeToVal :: RecTree Val -> Val
+recTreeToVal (RecLeaf v) = v
+recTreeToVal (RecTree r) = RecCon Cart $ fmap recTreeToVal r
+
+sumAt :: Type -> [Val] -> Val
+sumAt ty xs = foldr (addAt ty) (zeroAt ty) xs
+
+addAt :: Type -> Val -> Val -> Val
+addAt (BaseType RealType) x y = PrimOp FAdd [] [x, y]
+addAt (RecType k r) ~(RecCon _ xs) ~(RecCon _ ys) = RecCon k $ (recZipWith3 addAt r xs ys)
+addAt ty _ _ = error $ "Addition not implemented for type: " ++ pprint ty
+
+zeroAt :: Type -> Val
+zeroAt (BaseType RealType) = Lit (RealLit 0.0)
+zeroAt (RecType k r) = RecCon k $ fmap zeroAt r
+zeroAt ty = error $ "Zero not implemented for type: " ++ pprint ty

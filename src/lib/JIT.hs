@@ -5,246 +5,170 @@
 -- https://developers.google.com/open-source/licenses/bsd
 
 {-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
-module JIT (jitPass) where
+module JIT (evalModuleJIT, linking_hack) where
 
-import LLVM.AST hiding (Type, Add, Mul, Sub, FAdd, FSub, FMul, FDiv, Name, dest)
+import LLVM.AST (Operand, BasicBlock, Instruction, Named)
 import qualified LLVM.AST as L
 import qualified LLVM.AST.Global as L
 import qualified LLVM.AST.CallingConvention as L
 import qualified LLVM.AST.Type as L
+import qualified LLVM.AST.Typed as L
 import qualified LLVM.AST.Float as L
 import qualified LLVM.AST.Constant as C
-import qualified LLVM.AST.IntegerPredicate as L
 import qualified LLVM.AST.FloatingPointPredicate as L
+import qualified LLVM.AST.IntegerPredicate as L
 
 import Control.Monad
 import Control.Monad.State.Strict
 import Control.Monad.Reader
-import Control.Applicative (liftA, liftA2)
-
-import Data.Void
+import Data.Foldable (fold)
 import Data.List (nub)
-import Data.Traversable
-import Data.Time.Clock (getCurrentTime, diffUTCTime)
-
 import Data.ByteString.Short (toShort)
 import Data.ByteString.Char8 (pack)
-import Data.Word (Word64)
+import Data.String
+import Data.Text.Prettyprint.Doc
+import Foreign.Ptr
 
-import Data.Binary.IEEE754 (wordToDouble)
-
-import Type
 import Syntax
 import Env
-import Pass
-import Fresh hiding (freshName)
 import PPrint
 import Cat
-
+import Imp
+import Array
+import Subst
 import LLVMExec
 
--- TODO: figure out whether we actually need type everywhere here
-data Ptr w = Ptr w BaseType  deriving (Show)
+-- This forces the linker to link libdex.so. TODO: something better
+foreign import ccall "threefry2x32"  linking_hack :: Int -> Int -> Int
 
-data JitVal w = ScalarVal w BaseType
-              | ArrayVal (Ptr w) [w]  deriving (Show)
-
-data PCell w = Cell (Ptr w) [w]
-type Cell        = PCell Operand
-type PersistCell = PCell Word64
-
-type CompileVal  = JitVal Operand
-type PersistVal  = JitVal Word64
-type PersistEnv = Env PersistVal
-type ImpVarEnv = Env (Either CompileVal Cell)
-
+type CompileEnv = Env Operand
 data CompileState = CompileState { curBlocks   :: [BasicBlock]
                                  , curInstrs   :: [NInstr]
                                  , scalarDecls :: [NInstr]
                                  , blockName :: L.Name
+                                 , usedNames :: Scope
                                  , funSpecs :: [ExternFunSpec] -- TODO: use a set
                                  }
 
-type CompileM a = ReaderT ImpVarEnv (StateT CompileState (FreshT (Either Err))) a
-data CompiledProg = CompiledProg Module
-data ExternFunSpec = ExternFunSpec String L.Type [L.Type] deriving (Ord, Eq)
+type CompileM a = ReaderT CompileEnv (State CompileState) a
+data ExternFunSpec = ExternFunSpec L.Name L.Type [L.Type] deriving (Ord, Eq)
 
 type Long = Operand
 type NInstr = Named Instruction
 
-jitPass :: TopPass ImpDecl Void
-jitPass = TopPass jitPass'
+evalModuleJIT :: ImpModule -> IO (TopEnv, [Output])
+evalModuleJIT (Module _ (ImpModBody [] (ImpProg []) result)) =
+  return (result, [])
+evalModuleJIT (Module _ (ImpModBody vs prog result)) = do
+  dests <- liftM fold $ mapM allocIRef vs
+  let compileEnv = fmap arrayToOperand dests
+  let llvmModule = runCompileM compileEnv (compileTopProg prog)
+  let substEnv = (fmap (L . impExprToAtom . IRef) dests, mempty)
+  passInfo <- evalJit llvmModule
+  return (subst substEnv result, passInfo)
 
-jitPass' :: ImpDecl -> TopPassM PersistEnv Void
-jitPass' decl = case decl of
-  ImpTopLet bs prog -> do
-    vals <- evalProg bs prog
-    extend $ bindFold $ zipWith replaceAnnot bs vals
-    emitOutput NoOutput
-  ImpEvalCmd cont bs (Command cmd prog) -> case cmd of
-    ShowLLVM -> do
-      (_, CompiledProg m) <- toLLVM bs prog
-      llvm <- liftIO $ showLLVM m
-      emitOutput $ TextOut llvm
-    ShowAsm -> do
-      (_, CompiledProg m) <- toLLVM bs prog
-      asm <- liftIO $ showAsm m
-      emitOutput $ TextOut asm
-    EvalExpr fmt -> do
-      vals <- evalProg bs prog
-      vecs <- liftIO $ mapM asVec vals
-      env <- look
-      let tenv = flip envMapMaybe env $ \v ->
-                   case v of
-                 ScalarVal w _ -> Just (fromIntegral w)
-                 _ -> Nothing
-      emitOutput $ ValOut fmt $ cont tenv vecs
-    TimeIt -> do
-      t1 <- liftIO getCurrentTime
-      _ <- evalProg bs prog
-      t2 <- liftIO getCurrentTime
-      emitOutput $ TextOut $ show (t2 `diffUTCTime` t1)
-    _ -> error $ "Unexpected command: " ++ show cmd
+allocIRef :: IVar -> IO (Env Array)
+allocIRef v@(_:> IRefType (b, shape)) = do
+  ref <- allocateArray b (map fromILitInt shape)
+  return $ v @> ref
+allocIRef _ = error "Destination should have a reference type"
 
-evalProg :: [IBinder] -> ImpProg -> TopPassM PersistEnv [PersistVal]
-evalProg bs prog = do
-  (cells, CompiledProg m) <- toLLVM bs prog
-  liftIO $ evalJit m
-  liftIO $ mapM readPersistCell cells
+-- TODO: consider making an Integral instance
+fromILitInt :: IExpr -> Int
+fromILitInt (ILit (IntLit x)) = x
+fromILitInt expr = error $ "Not an int: " ++ pprint expr
 
--- This doesn't work with types derived from existentials, because the
--- existentially quantified variable isn't in scope yet
-makeDestCell :: PersistEnv -> IBinder -> IO (BinderP PersistCell)
-makeDestCell env (v :> IType ty shape) = do
-  ptr <- liftM ptrAsWord $ mallocBytes $ fromIntegral $ 8 * product shape'
-  return $ v :> Cell (Ptr ptr ty) shape'
-  where
-    getSize size = case size of
-      IVar v' -> scalarVal (env ! v')
-      ILit (IntLit n) -> fromIntegral n
-      _ -> error $ "Not a valid size: " ++ pprint size
-    shape' = map getSize shape
+runCompileM :: CompileEnv -> CompileM a -> a
+runCompileM env m = evalState (runReaderT m env) initState
+  where initState = CompileState [] [] [] "start_block" mempty []
 
--- TODO: pass destinations as args rather than baking pointers into LLVM
-toLLVM :: [IBinder] -> ImpProg -> TopPassM PersistEnv ([PersistCell], CompiledProg)
-toLLVM bs prog = do
-  env <- look
-  destCells <- liftIO $ mapM (makeDestCell env) bs
-  let env' =    fmap (Left  . asCompileVal) env
-             <> fmap (Right . asCompileCell) (bindFold destCells)
-  let initState = CompileState [] [] [] "start_block" []
-  prog' <- liftExceptTop $ flip runFreshT mempty $ flip evalStateT initState $
-                flip runReaderT env' $ compileTopProg prog
-  return (map binderAnn destCells, prog')
-
-asCompileVal :: PersistVal -> CompileVal
-asCompileVal (ScalarVal word ty) = ScalarVal (constOperand ty word) ty
-asCompileVal (ArrayVal ptr shape) = ArrayVal (ptrLiteral ptr) shape'
-  where shape' = map (constOperand IntType) shape
-
-asCompileCell :: PersistCell -> Cell
-asCompileCell (Cell ptr shape) = Cell (ptrLiteral ptr) shape'
-  where shape' = map (constOperand IntType) shape
-
-ptrLiteral :: Ptr Word64 -> Ptr Operand
-ptrLiteral (Ptr ptr ty) = Ptr ptr' ty
-  where ptr' = L.ConstantOperand $
-                  C.IntToPtr (C.Int 64 (fromIntegral ptr)) (L.ptr (scalarTy ty))
-
-readPersistCell :: PersistCell -> IO PersistVal
-readPersistCell (Cell (Ptr ptr ty) []) = do [word] <- readPtrs 1 (wordAsPtr ptr)
-                                            return $ ScalarVal word ty
-readPersistCell (Cell p shape) = return $ ArrayVal p shape
-
-asVec :: PersistVal -> IO Vec
-asVec v = case v of
-  ScalarVal x ty ->  return $ cast ty [x]
-  ArrayVal (Ptr ptr ty) shape -> do
-    let size = fromIntegral $ foldr (*) 1 shape
-    xs <- readPtrs size (wordAsPtr ptr)
-    return $ cast ty xs
-  where cast IntType  xs = IntVec $ map fromIntegral xs
-        cast BoolType xs = IntVec $ map fromIntegral xs
-        cast RealType xs = RealVec $ map interpret_ieee_64 xs
-        cast StrType _ = error "Not implemented"
-
--- From the data-binary-ieee754 package; is there a more standard way
--- to do this?  This is also janky because we are just assuming that
--- LLVM stores its floats in the ieee format.
-interpret_ieee_64 :: Word64 -> Double
-interpret_ieee_64 = wordToDouble
-
-constOperand :: BaseType -> Word64 -> Operand
-constOperand IntType  x = litInt (fromIntegral x)
-constOperand RealType x = litReal (interpret_ieee_64 x)
-constOperand BoolType _ = error "Not implemented"
-constOperand StrType  _ = error "Not implemented"
-
-compileTopProg :: ImpProg -> CompileM CompiledProg
+compileTopProg :: ImpProg -> CompileM L.Module
 compileTopProg prog = do
   compileProg prog
-  finishBlock (L.Ret Nothing []) (L.Name "")
+  finishBlock (L.Ret Nothing []) "<ignored>"
   specs <- gets funSpecs
   decls <- gets scalarDecls
   blocks <- gets (reverse . curBlocks)
-  return $ CompiledProg (makeModule decls blocks specs)
+  return $ makeModule decls blocks specs
 
 compileProg :: ImpProg -> CompileM ()
-compileProg (ImpProg statements) = mapM_ compileStatement statements
+compileProg (ImpProg []) = return ()
+compileProg (ImpProg ((maybeName, instr):prog)) = do
+  maybeAns <- compileInstr instr
+  let env = case (maybeName, maybeAns) of
+              (Nothing, Nothing)         -> mempty
+              (Just v, Just ans) -> v @> ans
+              _ -> error "Void mismatch"
+  extendR env $ compileProg $ ImpProg prog
 
-compileStatement :: Statement -> CompileM ()
-compileStatement statement = case statement of
-  Update v idxs b tys exprs -> do
-    vals <- mapM compileExpr exprs
-    cell <- lookupCellVar v
-    idxs' <- mapM compileExpr idxs
-    cell' <- idxCell cell idxs'
-    outVal <- case b of Copy -> let [val] = vals in return val
-                        _ -> compileBuiltin b tys vals
-    writeCell cell' outVal
-  Alloc (v :> IType b shape) body -> do
+compileInstr :: ImpInstr -> CompileM (Maybe Operand)
+compileInstr instr = case instr of
+  IPrimOp op -> do
+    op' <- traverseExpr op (return . scalarTy) compileExpr (return . const ())
+    liftM Just $ compilePrimOp op'
+  Load ref -> do
+    ref' <- compileExpr ref
+    liftM Just $ load ref'
+  Store dest val -> do
+    dest' <- compileExpr dest
+    val'  <- compileExpr val
+    store dest' val'
+    return Nothing
+  Copy dest source -> do
+    let (IRefType (_, shape)) = impExprType source
     shape' <- mapM compileExpr shape
-    cell <- allocate b shape' (nameTag v)
-    extendR (v @> Right cell) (compileProg body)
-    free cell
-  Loop i n body -> do n' <- compileExpr n
-                      compileLoop i n' body
+    dest'    <- compileExpr dest
+    source'  <- compileExpr source
+    case shape of
+      [] -> do
+        x <- load source'
+        store dest' x
+      _  -> do
+        numScalars <- sizeOf shape'
+        numBytes <- mul (litInt 8) numScalars
+        copy numBytes dest' source'
+    return Nothing
+  Alloc (ty, shape) -> liftM Just $ case shape of
+    [] -> alloca ty
+    _  -> do
+      shape' <- mapM compileExpr shape
+      malloc ty shape' ""
+  Free (_:> IRefType (_, [])) -> return Nothing  -- Don't free allocas
+  Free v -> do
+    v' <- lookupImpVar v
+    ptr' <- castLPtr charTy v'
+    addInstr $ L.Do (externCall freeFun [ptr'])
+    return Nothing
+  IGet x i -> do
+    let (IRefType (_, (_:shape))) = impExprType x
+    shape' <- mapM compileExpr shape
+    x' <- compileExpr x
+    i' <- compileExpr i
+    liftM Just $ indexPtr x' shape' i'
+  Loop d i n body -> do
+    n' <- compileExpr n
+    compileLoop d i n' body
+    return Nothing
 
-compileExpr :: IExpr -> CompileM CompileVal
+compileExpr :: IExpr -> CompileM Operand
 compileExpr expr = case expr of
-  ILit v -> return $ ScalarVal (litVal v) (litType v)
-  IVar v -> do x <- lookupImpVar v
-               case x of
-                 Left val -> return val
-                 Right cell@(Cell ptr shape) -> case shape of
-                    [] -> readScalarCell cell
-                    _  -> return $ ArrayVal ptr shape
-  IGet v i -> do ~(ArrayVal ptr (_:shape)) <- compileExpr v
-                 ~(ScalarVal i' _) <- compileExpr i
-                 ptr'@(Ptr _ ty) <- indexPtr ptr shape i'
-                 case shape of
-                   [] -> do x <- load ptr'
-                            return $ ScalarVal x ty
-                   _  -> return $ ArrayVal ptr' shape
+  ILit v   -> return (litVal v)
+  IRef x   -> return $ arrayToOperand x
+  IVar v   -> lookupImpVar v
 
-lookupImpVar :: Name -> CompileM (Either CompileVal Cell)
+arrayToOperand :: Array -> Operand
+arrayToOperand (Array _ b ptr) = refLiteral b ptr
+
+lookupImpVar :: IVar -> CompileM Operand
 lookupImpVar v = asks (! v)
 
-readScalarCell :: Cell -> CompileM CompileVal
-readScalarCell (Cell ptr@(Ptr _ ty) []) = do op <- load ptr
-                                             return $ ScalarVal op ty
-readScalarCell _ = error "Not a scalar cell"
-
-lookupCellVar :: Name -> CompileM Cell
-lookupCellVar v = do { ~(Right cell) <- lookupImpVar v; return cell }
-
-indexPtr :: Ptr Operand -> [Operand] -> Operand -> CompileM (Ptr Operand)
-indexPtr (Ptr ptr ty) shape i = do
+indexPtr :: Operand -> [Operand] -> Operand -> CompileM Operand
+indexPtr ptr shape i = do
   stride <- foldM mul (litInt 1) shape
   n <- mul stride i
-  ptr' <- evalInstr "ptr" (L.ptr (scalarTy ty)) $ L.GetElementPtr False ptr [n] []
-  return (Ptr ptr' ty)
+  emitInstr (L.typeOf ptr) $ L.GetElementPtr False ptr [n] []
 
 finishBlock :: L.Terminator -> L.Name -> CompileM ()
 finishBlock term newName = do
@@ -255,50 +179,48 @@ finishBlock term newName = do
          . setCurInstrs (const [])
          . setBlockName (const newName)
 
-compileLoop :: Name -> CompileVal -> ImpProg -> CompileM ()
-compileLoop iVar (ScalarVal n _) body = do
+compileLoop :: Direction -> IVar -> Operand -> ImpProg -> CompileM ()
+compileLoop d iVar n body = do
   loopBlock <- freshName "loop"
   nextBlock <- freshName "cont"
-  Cell i _ <- alloca IntType "i"
-  store i (litInt 0)
-  entryCond <- load i >>= (`lessThan` n)
+  i <- alloca IntType
+  i0 <- case d of Fwd -> return $ litInt 0
+                  Rev -> n `sub` litInt 1
+  store i i0
+  entryCond <- litInt 0 `lessThan` n
   finishBlock (L.CondBr entryCond loopBlock nextBlock []) loopBlock
   iVal <- load i
-  extendR (iVar @> (Left $ ScalarVal iVal IntType)) $
-    compileProg body
-  iValInc <- add iVal (litInt 1)
-  store i iValInc
-  loopCond <- iValInc `lessThan` n
+  extendR (iVar @> iVal) $ compileProg body
+  iValNew <- case d of Fwd -> add iVal $ litInt 1
+                       Rev -> sub iVal $ litInt 1
+  store i iValNew
+  loopCond <- case d of Fwd -> iValNew `lessThan` n
+                        Rev -> iValNew `greaterOrEq` litInt 0
   finishBlock (L.CondBr loopCond loopBlock nextBlock []) nextBlock
-compileLoop _ (ArrayVal _ _) _ = error "Array-valued loop max"
 
-freshName :: String -> CompileM L.Name
-freshName s = do name <- fresh s
-                 return $ strToName $ pprint name
+freshName :: Name -> CompileM L.Name
+freshName v = do
+  used <- gets usedNames
+  let v'@(name:>_) = rename (v:>()) used
+  modify $ \s -> s { usedNames = used <> v'@>() }
+  return $ nameToLName name
 
-idxCell :: Cell -> [CompileVal] -> CompileM Cell
-idxCell cell [] = return cell
-idxCell (Cell ptr (_:shape)) (i:idxs) = do
-  size <- sizeOf shape
-  step <- mul size (scalarVal i)
-  ptr' <- addPtr ptr step
-  idxCell (Cell ptr' shape) idxs
-idxCell _ _ = error "Index mismatch"
+copy :: Operand -> Operand -> Operand -> CompileM ()
+copy numBytes dest src = do
+  src'  <- castLPtr charTy src
+  dest' <- castLPtr charTy dest
+  addInstr $ L.Do (externCall memcpyFun [dest', src', numBytes])
 
-writeCell :: Cell -> CompileVal -> CompileM ()
-writeCell (Cell ptr []) (ScalarVal x _) = store ptr x
-writeCell (Cell (Ptr dest _) shape) (ArrayVal (Ptr src _) _) = do
-  numScalars <- sizeOf shape
-  numBytes <- mul (litInt 8) numScalars
-  addInstr $ L.Do (externCall memcpyFun [dest, src, numBytes])
-writeCell _ _ = error $ "Bad value type for cell"
+refLiteral :: BaseType -> Ptr () -> Operand
+refLiteral ty ptr = L.ConstantOperand $ C.IntToPtr (C.Int 64 ptrAsInt) (L.ptr (scalarTy ty))
+   where ptrAsInt = fromIntegral $ ptrToWordPtr ptr
 
 litVal :: LitVal -> Operand
 litVal lit = case lit of
   IntLit  x -> litInt x
   RealLit x -> litReal x
-  BoolLit True  -> L.ConstantOperand $ C.Int 1 1
-  BoolLit False -> L.ConstantOperand $ C.Int 1 0
+  BoolLit True  -> litInt 1
+  BoolLit False -> litInt 0
   StrLit _ -> error "Not implemented"
 
 litInt :: Int -> Operand
@@ -307,63 +229,55 @@ litInt x = L.ConstantOperand $ C.Int 64 (fromIntegral x)
 litReal :: Double -> Operand
 litReal x = L.ConstantOperand $ C.Float $ L.Double x
 
-store :: Ptr Operand -> Operand -> CompileM ()
-store (Ptr ptr _) x =  addInstr $ L.Do $ L.Store False ptr x Nothing 0 []
+store :: Operand -> Operand -> CompileM ()
+store ptr x =  addInstr $ L.Do $ L.Store False ptr x Nothing 0 []
 
-load :: Ptr Operand -> CompileM Operand
-load (Ptr ptr ty) = evalInstr "" (scalarTy ty) $ L.Load False ptr Nothing 0 []
+load :: Operand -> CompileM Operand
+load ptr = emitInstr valTy $ L.Load False ptr Nothing 0 []
+  where (L.PointerType valTy _) = L.typeOf ptr
 
 lessThan :: Long -> Long -> CompileM Long
-lessThan x y = evalInstr "lt" longTy $ L.ICmp L.SLT x y []
+lessThan x y = emitInstr longTy $ L.ICmp L.SLT x y []
+
+greaterOrEq :: Long -> Long -> CompileM Long
+greaterOrEq x y = emitInstr longTy $ L.ICmp L.SGE x y []
 
 add :: Long -> Long -> CompileM Long
-add x y = evalInstr "add" longTy $ L.Add False False x y []
+add x y = emitInstr longTy $ L.Add False False x y []
 
-evalInstr :: String -> L.Type -> Instruction -> CompileM Operand
-evalInstr s ty instr = do v <- freshName s
-                          addInstr $ v L.:= instr
-                          return $ L.LocalReference ty v
+sub :: Long -> Long -> CompileM Long
+sub x y = emitInstr longTy $ L.Sub False False x y []
 
-addPtr :: Ptr Operand -> Long -> CompileM (Ptr Operand)
-addPtr (Ptr ptr ty) i = do ptr' <- evalInstr "ptr" (L.ptr (scalarTy ty)) instr
-                           return $ Ptr ptr' ty
-  where instr = L.GetElementPtr False ptr [i] []
+-- TODO: consider getting type from instruction rather than passing it explicitly
+emitInstr :: L.Type -> Instruction -> CompileM Operand
+emitInstr ty instr = do
+  v <- freshName "v"
+  addInstr $ v L.:= instr
+  return $ L.LocalReference ty v
 
-alloca :: BaseType -> String -> CompileM Cell
-alloca ty s = do v <- freshName s
-                 modify $ setScalarDecls ((v L.:= instr):)
-                 return $ Cell (Ptr (L.LocalReference (L.ptr ty') v) ty) []
+alloca :: BaseType -> CompileM Operand
+alloca ty = do
+  v <- freshName "v"
+  modify $ setScalarDecls ((v L.:= instr):)
+  return $ L.LocalReference (L.ptr ty') v
   where ty' = scalarTy ty
         instr = L.Alloca ty' Nothing 0 []
 
-malloc :: BaseType -> [CompileVal] -> String -> CompileM Cell
-malloc ty shape s = do
-    size <- sizeOf shape'
+malloc :: BaseType -> [Operand] -> Tag -> CompileM Operand
+malloc ty shape _ = do
+    size <- sizeOf shape
     n <- mul (litInt 8) size
-    voidPtr <- evalInstr "" charPtrTy (externCall mallocFun [n])
-    ptr <- evalInstr s (L.ptr ty') $ L.BitCast voidPtr (L.ptr ty') []
-    return $ Cell (Ptr ptr ty) shape'
-  where shape' = map scalarVal shape
-        ty' = scalarTy ty
+    voidPtr <- emitInstr charPtrTy (externCall mallocFun [n])
+    castLPtr (scalarTy ty) voidPtr
 
-allocate :: BaseType -> [CompileVal] -> String -> CompileM Cell
-allocate b shape s = case shape of [] -> alloca b s
-                                   _ -> malloc b shape s
-
-free :: Cell -> CompileM ()
-free (Cell (Ptr ptr _) shape) =
-  case shape of [] -> return ()
-                _  -> addInstr $ L.Do (externCall freeFun [ptr])
+castLPtr :: L.Type -> Operand -> CompileM Operand
+castLPtr ty ptr = emitInstr (L.ptr ty) $ L.BitCast ptr (L.ptr ty) []
 
 sizeOf :: [Operand] -> CompileM Operand
 sizeOf shape = foldM mul (litInt 1) shape
 
 mul :: Operand -> Operand -> CompileM Operand
-mul x y = evalInstr "mul" longTy $ L.Mul False False x y []
-
-scalarVal :: JitVal a -> a
-scalarVal (ScalarVal x _) = x
-scalarVal (ArrayVal _ _) = error "Not a scalar val"
+mul x y = emitInstr longTy $ L.Mul False False x y []
 
 addInstr :: Named Instruction -> CompileM ()
 addInstr instr = modify $ setCurInstrs (instr:)
@@ -373,53 +287,62 @@ scalarTy ty = case ty of
   IntType  -> longTy
   RealType -> realTy
   BoolType -> boolTy -- Still storing in 64-bit arrays TODO: use 8 bits (or 1)
-  StrType -> error "Not implemented"
+  StrType  -> error "Not implemented"
 
-compileBinop :: BaseType -> (Operand -> Operand -> L.Instruction)
-                -> [CompileVal]
-                -> CompileM CompileVal
-compileBinop ty makeInstr [ScalarVal x _, ScalarVal y _] =
-  liftM (flip ScalarVal ty) $ evalInstr "" (scalarTy ty) (makeInstr x y)
-compileBinop _ _ xs = error $ "Bad args: " ++ show xs
+extendOneBit :: Operand -> CompileM Operand
+extendOneBit x = emitInstr boolTy (L.ZExt x boolTy [])
 
-compileUnop :: BaseType -> (Operand -> L.Instruction)
-                -> [CompileVal]
-                -> CompileM CompileVal
-compileUnop ty makeInstr [ScalarVal x _] =
-  liftM (flip ScalarVal ty) $ evalInstr "" (scalarTy ty) (makeInstr x)
-compileUnop _ _ xs = error $ "Bad args: " ++ show xs
-
-compileFFICall :: String -> [IType] -> [CompileVal] -> CompileM CompileVal
-compileFFICall name tys xs = do
-  ans <- evalInstr name retTy' $ externCall f (map scalarVal xs)
+compileFFICall :: String -> [L.Type] -> L.Type -> [Operand] -> CompileM Operand
+compileFFICall name argTys retTy xs = do
   modify $ setFunSpecs (f:)
-  return $ ScalarVal ans retTy
-  where
-    fromScalarIType :: IType -> BaseType
-    fromScalarIType (IType b []) = b
-    fromScalarIType ty = error $ "Not a scalar: " ++ pprint ty
-    retTy:argTys = map fromScalarIType tys
-    retTy':argTys' = map scalarTy (retTy:argTys)
-    f = ExternFunSpec name retTy' argTys'
+  emitInstr retTy $ externCall f xs
+  where f = ExternFunSpec (L.Name (fromString name)) retTy argTys
 
-compileBuiltin :: Builtin -> [IType] -> [CompileVal] -> CompileM CompileVal
-compileBuiltin b ts = case b of
-  IAdd     -> compileBinop IntType (\x y -> L.Add False False x y [])
-  ISub     -> compileBinop IntType (\x y -> L.Sub False False x y [])
-  IMul     -> compileBinop IntType (\x y -> L.Mul False False x y [])
-  Mod      -> compileBinop IntType (\x y -> L.URem x y [])
-  FAdd     -> compileBinop RealType (\x y -> L.FAdd noFastMathFlags x y [])
-  FSub     -> compileBinop RealType (\x y -> L.FSub noFastMathFlags x y [])
-  FMul     -> compileBinop RealType (\x y -> L.FMul noFastMathFlags x y [])
-  FDiv     -> compileBinop RealType (\x y -> L.FDiv noFastMathFlags x y [])
-  FLT      -> compileBinop BoolType (\x y -> L.FCmp L.OLT x y [])
-  FGT      -> compileBinop BoolType (\x y -> L.FCmp L.OGT x y [])
-  Todo     -> const $ throw OtherErr "Can't compile 'todo'"
-  BoolToInt -> compileUnop IntType  (\x -> L.ZExt x longTy [])
-  IntToReal -> compileUnop RealType (\x -> L.SIToFP x realTy [])
-  FFICall _ name -> compileFFICall name ts
-  Scan     -> error "Scan should have been lowered away by now."
-  _ -> error $ "Primop not implemented: " ++ pprint b
+compilePrimOp :: PrimOp L.Type Operand () -> CompileM Operand
+compilePrimOp (ScalarBinOp op x y) = case op of
+  IAdd   -> emitInstr longTy $ L.Add False False x y []
+  ISub   -> emitInstr longTy $ L.Sub False False x y []
+  IMul   -> emitInstr longTy $ L.Mul False False x y []
+  IDiv   -> emitInstr longTy $ L.SDiv False x y []
+  Rem    -> emitInstr longTy $ L.SRem x y []
+  FAdd   -> emitInstr realTy $ L.FAdd L.noFastMathFlags x y []
+  FSub   -> emitInstr realTy $ L.FSub L.noFastMathFlags x y []
+  FMul   -> emitInstr realTy $ L.FMul L.noFastMathFlags x y []
+  FDiv   -> emitInstr realTy $ L.FDiv L.noFastMathFlags x y []
+  And    -> emitInstr boolTy $ L.And x y []
+  Or     -> emitInstr boolTy $ L.Or  x y []
+  ICmp c -> emitInstr boolTy (L.ICmp (intCmpOp   c) x y []) >>= extendOneBit
+  FCmp c -> emitInstr boolTy (L.FCmp (floatCmpOp c) x y []) >>= extendOneBit
+  _ -> error "Not implemented"
+compilePrimOp (ScalarUnOp op x) = case op of
+  -- LLVM has "fneg" but it doesn't seem to be exposed by llvm-hs-pure
+  FNeg      -> emitInstr realTy $ L.FSub L.noFastMathFlags (litReal 0.0) x []
+  Not       -> emitInstr boolTy $ L.Xor x (litInt 1) []
+  BoolToInt -> return x -- bools stored as ints
+  IntToReal -> emitInstr realTy $ L.SIToFP x realTy []
+  _ -> error "Not implemented"
+compilePrimOp (Select ty p x y) = do
+  p' <- emitInstr (L.IntegerType 1) $ L.Trunc p (L.IntegerType 1) []
+  emitInstr ty $ L.Select p' x y []
+compilePrimOp (FFICall name argTys ansTy xs) =
+  compileFFICall name argTys ansTy xs
+compilePrimOp op = error $ "Can't JIT primop: " ++ pprint op
+
+floatCmpOp :: CmpOp -> L.FloatingPointPredicate
+floatCmpOp op = case op of
+  Less         -> L.OLT
+  LessEqual    -> L.OLE
+  Greater      -> L.OGT
+  GreaterEqual -> L.OGE
+  Equal        -> L.OEQ
+
+intCmpOp :: CmpOp -> L.IntegerPredicate
+intCmpOp op = case op of
+  Less         -> L.SLT
+  LessEqual    -> L.SLE
+  Greater      -> L.SGT
+  GreaterEqual -> L.SGE
+  Equal        -> L.EQ
 
 mallocFun :: ExternFunSpec
 mallocFun  = ExternFunSpec "malloc_dex"    charPtrTy [longTy]
@@ -434,10 +357,13 @@ builtinFFISpecs :: [ExternFunSpec]
 builtinFFISpecs = [mallocFun, freeFun, memcpyFun]
 
 charPtrTy :: L.Type
-charPtrTy = L.ptr (L.IntegerType 8)
+charPtrTy = L.ptr charTy
+
+charTy :: L.Type
+charTy = L.IntegerType 8
 
 boolTy :: L.Type
-boolTy = L.IntegerType 1
+boolTy = L.IntegerType 64
 
 longTy :: L.Type
 longTy = L.IntegerType 64
@@ -448,7 +374,7 @@ realTy = L.FloatingPointType L.DoubleFP
 funTy :: L.Type -> [L.Type] -> L.Type
 funTy retTy argTys = L.ptr $ L.FunctionType retTy argTys False
 
-makeModule :: [NInstr] -> [BasicBlock] -> [ExternFunSpec] -> Module
+makeModule :: [NInstr] -> [BasicBlock] -> [ExternFunSpec] -> L.Module
 makeModule decls (fstBlock:blocks) userSpecs = m
   where
     L.BasicBlock name instrs term = fstBlock
@@ -468,22 +394,22 @@ externCall :: ExternFunSpec -> [L.Operand] -> L.Instruction
 externCall (ExternFunSpec fname retTy argTys) xs =
   L.Call Nothing L.C [] fun xs' [] []
   where fun = Right $ L.ConstantOperand $ C.GlobalReference
-                         (funTy retTy argTys) (strToName fname)
+                         (funTy retTy argTys) fname
         xs' = [(x ,[]) | x <- xs]
 
 externDecl :: ExternFunSpec -> L.Definition
 externDecl (ExternFunSpec fname retTy argTys) =
   L.GlobalDefinition $ L.functionDefaults {
-    L.name        = strToName fname
+    L.name        = fname
   , L.parameters  = ([L.Parameter t (argName i) []
                      | (i, t) <- zip [0::Int ..] argTys], False)
   , L.returnType  = retTy
   , L.basicBlocks = []
   }
-  where argName i = strToName ("arg" ++ show i)
+  where argName i = L.Name $ "arg" <> fromString (show i)
 
-strToName :: String -> L.Name
-strToName s = L.Name $ toShort $ pack s
+nameToLName :: Name -> L.Name
+nameToLName v = L.Name (toShort $ pack (pprint v))
 
 setScalarDecls :: ([NInstr] -> [NInstr]) -> CompileState -> CompileState
 setScalarDecls update s = s { scalarDecls = update (scalarDecls s) }
@@ -500,26 +426,8 @@ setBlockName update s = s { blockName = update (blockName s) }
 setFunSpecs :: ([ExternFunSpec] -> [ExternFunSpec]) -> CompileState -> CompileState
 setFunSpecs update s = s { funSpecs = update (funSpecs s) }
 
-instance Functor JitVal where
-  fmap = fmapDefault
+instance Pretty L.Operand where
+  pretty x = pretty (show x)
 
-instance Foldable JitVal where
-  foldMap = foldMapDefault
-
-instance Traversable JitVal where
-  traverse f val = case val of
-    ScalarVal x ty -> liftA (\x' -> ScalarVal x' ty) (f x)
-    ArrayVal (Ptr ptr ty) shape ->
-      liftA2 newVal (f ptr) (traverse f shape)
-      where newVal ptr' shape' = ArrayVal (Ptr ptr' ty) shape'
-
-instance Functor JitVals where
-  fmap = fmapDefault
-
-instance Foldable JitVals where
-  foldMap = foldMapDefault
-
-instance Traversable JitVals where
-  traverse f (JitVals vals) = liftA JitVals $ traverse (traverse f) vals
-
-newtype JitVals w = JitVals [JitVal w]
+instance Pretty L.Type where
+  pretty x = pretty (show x)

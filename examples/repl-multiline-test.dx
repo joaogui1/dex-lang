@@ -1,0 +1,21 @@
+
+-- comment
+
+'Single-line multiline comment
+
+:p
+   triple = \x.
+     y = x + x
+     x + y
+   triple 10.0
+
+f = \x:Int.
+  (x,
+  x)
+
+f 1
+
+y = 1. +
+    2.
+
+:p y

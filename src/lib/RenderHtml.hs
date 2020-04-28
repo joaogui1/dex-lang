@@ -7,7 +7,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
-module RenderHtml (pprintHtml, progHtml) where
+module RenderHtml (pprintHtml, progHtml, ToMarkup) where
 
 import Text.Blaze.Html5 as H  hiding (map)
 import Text.Blaze.Html5.Attributes as At
@@ -21,16 +21,16 @@ import Text.Megaparsec.Char as C
 
 import Syntax
 import PPrint
-import ParseUtil
+import Parser
 import Plot
+import Serialize()
 
 pprintHtml :: ToMarkup a => a -> String
 pprintHtml x = renderHtml $ toMarkup x
 
 progHtml :: LitProg -> String
 progHtml blocks = renderHtml $ wrapBody $ map toHtmlBlock blocks
-  where
-    toHtmlBlock (block,result) = toMarkup block <> toMarkup result
+  where toHtmlBlock (block,result) = toMarkup block <> toMarkup result
 
 wrapBody :: [Html] -> Html
 wrapBody blocks = docTypeHtml $ do
@@ -41,13 +41,16 @@ wrapBody blocks = docTypeHtml $ do
   where inner = foldMap (cdiv "cell") blocks
 
 instance ToMarkup Result where
-  toMarkup result = case result of
-    Result (Left _) -> cdiv "err-block" $ toHtml $ pprint result
-    Result (Right ans) -> case ans of
-      NoOutput -> mempty
-      ValOut Heatmap val -> cdiv "plot" $ heatmapHtml val
-      ValOut Scatter val -> cdiv "plot" $ scatterHtml val
-      _ -> cdiv "result-block" $ toHtml $ pprint result
+  toMarkup (Result outs err) = foldMap toMarkup outs <> err'
+    where err' = case err of
+                   Left e   -> cdiv "err-block" $ toHtml $ pprint e
+                   Right () -> mempty
+
+instance ToMarkup Output where
+  toMarkup out = case out of
+    HeatmapOut h w zs -> heatmapHtml h w zs
+    ScatterOut xs ys  -> scatterHtml xs ys
+    _ -> cdiv "result-block" $ toHtml $ pprint out
 
 instance ToMarkup SourceBlock where
   toMarkup block = case sbContents block of
@@ -65,7 +68,7 @@ cdiv c inner = H.div inner ! class_ (stringValue c)
 highlightSyntax :: String -> Html
 highlightSyntax s = foldMap (uncurry syntaxSpan) classified
   where
-    classified = case parse (many (withSource classify) <* eof) "" s of
+    classified = case runTheParser s (many (withSource classify) <* eof) of
                    Left e -> error $ errorBundlePretty e
                    Right ans -> ans
 
@@ -87,7 +90,7 @@ data StrClass = NormalStr
 classify :: Parser StrClass
 classify =
        (try (char ':' >> lowerWord) >> return CommandStr)
-   <|> (symbol "--" >> manyTill anySingle (void eol <|> eof) >> return CommentStr)
+   <|> (symbol "-- " >> manyTill anySingle (void eol <|> eof) >> return CommentStr)
    <|> (do s <- lowerWord
            return $ if s `elem` keywords then KeywordStr else NormalStr)
    <|> (symbol "A " >> return KeywordStr)
@@ -96,8 +99,8 @@ classify =
    <|> (choice (map C.string symbols ) >> return SymbolStr)
    <|> (anySingle >> return NormalStr)
   where
-   keywords = ["for", "lam", "let", "in", "unpack", "pack", "type", "todo"]
-   symbols = ["+", "*", "/", "-", "^", "$", "@", ".", "::", ";", "=", ">", "<"]
+   keywords = ["for", "lam", "llam", "let", "in", "unpack", "pack", "type", "newtype", "todo"]
+   symbols = ["--o", "+", "*", "/", "-", "^", "$", "@", ".", ":", ";", "=", ">", "<", "#"]
 
 lowerWord :: Parser String
 lowerWord = (:) <$> lowerChar <*> many alphaNumChar

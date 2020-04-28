@@ -6,38 +6,49 @@
 
 {-# LANGUAGE OverloadedStrings #-}
 
-module LLVMExec (showLLVM, evalJit, readPtrs, wordAsPtr, ptrAsWord,
-                 mallocBytes, showAsm) where
+module LLVMExec (showLLVM, evalJit) where
 
+import qualified LLVM.Analysis as L
 import qualified LLVM.AST as L
 import qualified LLVM.Module as Mod
 import qualified LLVM.PassManager as P
 import qualified LLVM.ExecutionEngine as EE
 import qualified LLVM.Target as T
 import LLVM.Context
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 
 import Foreign.Ptr
-import Foreign.Storable
-import Foreign.Marshal.Alloc (mallocBytes)
-
+import Control.Exception
 import Control.Monad
-import Data.Word (Word64)
 import Data.ByteString.Char8 (unpack)
+import Data.Maybe (fromMaybe)
+
+import Syntax
 
 foreign import ccall "dynamic"
   haskFun :: FunPtr (IO ()) -> IO ()
 
-evalJit :: L.Module -> IO ()
-evalJit m =
+evalJit :: L.Module -> IO [Output]
+evalJit ast = do
+  T.initializeAllTargets
   withContext $ \c ->
-    Mod.withModuleFromAST c m $ \m' -> do
-      runPasses m'
-      jit c $ \ee ->
-         EE.withModuleInEngine ee m' $ \eee -> do
-           f <- EE.getFunction eee (L.Name "thefun")
-           case f of
-             Just f' -> runJitted f'
-             Nothing -> error "Failed to fetch \"thefun\" from LLVM"
+    Mod.withModuleFromAST c ast $ \m -> do
+      L.verify m
+      preOpt <- showModule m
+      runPasses m
+      postOpt <- showModule m
+      asm <- showAsm m
+      jit c $ \ee -> do
+        EE.withModuleInEngine ee m $ \eee -> do
+          f <- liftM (fromMaybe (error "failed to fetch function")) $
+                 EE.getFunction eee (L.Name "thefun")
+          t1 <- getCurrentTime
+          runJitted f
+          t2 <- getCurrentTime
+          return [ PassInfo JitPass "" preOpt
+                 , PassInfo LLVMOpt "" postOpt
+                 , PassInfo AsmPass "" asm
+                 , PassInfo LLVMEval "" (show (t2 `diffUTCTime` t1))]
 
 jit :: Context -> (EE.MCJIT -> IO a) -> IO a
 jit c = EE.withMCJIT c (Just 3) Nothing Nothing Nothing
@@ -49,34 +60,28 @@ runPasses :: Mod.Module -> IO ()
 runPasses m = P.withPassManager passes $ \pm -> void $ P.runPassManager pm m
 
 showLLVM :: L.Module -> IO String
-showLLVM m =
+showLLVM m = do
+  T.initializeAllTargets
   withContext $ \c ->
     Mod.withModuleFromAST c m $ \m' -> do
+      verifyErr <- verifyAndRecover m'
       prePass <- showModule m'
       runPasses m'
       postPass <- showModule m'
-      return $ "Input LLVM:\n\n" ++ prePass ++ "\nAfter passes:\n\n" ++ postPass
-  where
-    showModule :: Mod.Module -> IO String
-    showModule m' = liftM unpack $ Mod.moduleLLVMAssembly m'
+      return $ verifyErr ++ "Input LLVM:\n\n" ++ prePass
+            ++ "\nAfter passes:\n\n" ++ postPass
 
-showAsm :: L.Module -> IO String
-showAsm m =
-  withContext $ \c ->
-    Mod.withModuleFromAST c m $ \m' -> do
-      runPasses m'
-      T.withHostTargetMachine $ \t ->
-        liftM unpack $ Mod.moduleTargetAssembly t m'
+showModule :: Mod.Module -> IO String
+showModule m = liftM unpack $ Mod.moduleLLVMAssembly m
 
-readPtrs :: Int -> Ptr Word64 -> IO [Word64]
-readPtrs n ptr = mapM readAt [0..n-1]
-  where readAt i = peek $ ptr `plusPtr` (8 * i)
+verifyAndRecover :: Mod.Module -> IO String
+verifyAndRecover m =
+  (L.verify m >> return  "") `catch`
+    (\e -> return ("\nVerification error:\n" ++ show (e::SomeException) ++ "\n"))
 
-wordAsPtr :: Word64 -> Ptr a
-wordAsPtr x = wordPtrToPtr $ fromIntegral x
-
-ptrAsWord :: Ptr a -> Word64
-ptrAsWord ptr = fromIntegral $ ptrToWordPtr ptr
+showAsm :: Mod.Module -> IO String
+showAsm m = T.withHostTargetMachineDefault $ \t ->
+              liftM unpack $ Mod.moduleTargetAssembly t m
 
 passes :: P.PassSetSpec
 passes = P.defaultCuratedPassSetSpec {P.optLevel = Just 3}

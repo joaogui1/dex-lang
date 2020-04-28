@@ -11,8 +11,8 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 module Cat (CatT, MonadCat, runCatT, look, extend, scoped, looks, extendLocal,
-            extendR, captureW, asFst, asSnd,
-            Cat, runCat, catTraverse) where
+            extendR, captureW, asFst, asSnd, capture, asCat, evalCatT,
+            Cat, runCat, newCatT, catTraverse, catFold) where
 
 -- Monad for tracking monoidal state
 
@@ -25,7 +25,7 @@ import Control.Monad.Except hiding (Except)
 newtype CatT env m a = CatT (StateT (env, env) m a)
   deriving (Functor, Applicative, Monad, MonadTrans, MonadIO)
 
-type Cat env a = CatT env Identity a
+type Cat env = CatT env Identity
 
 class (Monoid env, Monad m) => MonadCat env m | m -> env where
   look   :: m env
@@ -68,20 +68,40 @@ instance MonadCat env m => MonadCat env (ExceptT e m) where
   extend x = lift $ extend x
   scoped = error "TODO"
 
-instance MonadError e m => MonadError e (CatT env m) where
+instance (Monoid env, MonadError e m) => MonadError e (CatT env m) where
   throwError = lift . throwError
-  catchError = undefined
+  catchError m catch = do
+    env <- look
+    (ans, env') <- lift $ runCatT m env `catchError` (\e -> runCatT (catch e) env)
+    extend env'
+    return ans
 
 runCatT :: (Monoid env, Monad m) => CatT env m a -> env -> m (a, env)
 runCatT (CatT m) initEnv = do
   (ans, (_, newEnv)) <- runStateT m (initEnv, mempty)
   return (ans, newEnv)
 
+evalCatT :: (Monoid env, Monad m) => CatT env m a -> m a
+evalCatT m = liftM fst $ runCatT m mempty
+
+newCatT :: (Monoid env, Monad m) => (env -> m (a, env)) -> CatT env m a
+newCatT  f = do
+  env <- look
+  (ans, env') <- lift $ f env
+  extend env'
+  return ans
+
 runCat :: Monoid env => Cat env a -> env -> (a, env)
 runCat m env = runIdentity $ runCatT m env
 
 looks :: (Monoid env, MonadCat env m) => (env -> a) -> m a
 looks getter = liftM getter look
+
+capture :: (Monoid env, MonadCat env m) => m a -> m (a, env)
+capture m = do
+  (x, env) <- scoped m
+  extend env
+  return (x, env)
 
 extendLocal :: (Monoid env, MonadCat env m) => env -> m a -> m a
 extendLocal x m = do
@@ -97,6 +117,10 @@ catTraverse :: (Monoid env, MonadReader env m, Traversable f)
 catTraverse f xs = do
   env <- ask
   runCatT (traverse (asCat f) xs) env
+
+catFold :: (Monoid env, MonadReader env m, Traversable f)
+        => (a -> m env) -> f a -> m env
+catFold f xs = liftM snd $ catTraverse (liftM ((,) ()) . f) xs
 
 asCat :: (Monoid env, MonadReader env m)
             => (a -> m (b, env)) -> a -> CatT env m b

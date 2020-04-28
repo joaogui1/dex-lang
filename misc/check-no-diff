@@ -1,0 +1,9 @@
+#!/bin/bash
+
+tmpdiff=$(mktemp)
+diff --left-column -y $1 $2 > $tmpdiff \
+       && echo OK || (cat $tmpdiff; false)
+status=$?
+
+rm $tmpdiff
+exit $status

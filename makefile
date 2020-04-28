@@ -2,16 +2,41 @@
 # executables, to support user-account installation of stack.
 SHELL=/bin/bash
 
-dex := stack exec dex --
+STACK=$(shell command -v stack 2>/dev/null)
+ifeq (, $(STACK))
+	STACK=cabal
+
+  PROF := --enable-library-profiling --enable-executable-profiling
+
+	dex     := cabal exec dex --
+	dexprof := cabal exec $(PROF) dex -- +RTS -p -RTS
+else
+	STACK=stack
+
+	# Using separate stack-work directories to avoid recompiling when
+	# changing between debug and non-debug builds, per
+	# https://github.com/commercialhaskell/stack/issues/1132#issuecomment-386666166
+	PROF := --profile --work-dir .stack-work-prof
+
+	dex     := stack exec         dex --
+	dexprof := stack exec $(PROF) dex --
+endif
+
 
 # --- building Dex ---
 
-all: cbits/libdex.so
-	stack build
+all: build
 
-# The web interface uses Linux's inotify API. On non-Linux, we have to build without it.
-all-non-linux: cbits/libdex.so
-	stack build --flag dex:-web
+build: cbits/libdex.so
+	$(STACK) build
+
+build-prof: cbits/libdex.so
+	$(STACK) build $(PROF)
+
+all-inotify: build-inotify
+
+build-inotify: cbits/libdex.so
+	$(STACK) build --flag dex:inotify $(PROF)
 
 %.so: %.c
 	gcc -fPIC -shared $^ -o $@
@@ -20,34 +45,49 @@ libdex: cbits/libdex.so
 
 # --- running tets ---
 
-example-names = type-tests eval-tests shadow-tests annot-tests \
-                flop-tests tutorial mandelbrot pi sierpinsky \
-                regression brownian_motion
+example-names = type-tests eval-tests shadow-tests annot-tests linear-tests ad-tests \
+                monad-tests include-test mandelbrot pi sierpinsky \
+                regression brownian_motion chol particle-swarm-optimizer \
+                ode-integrator
 quine-test-targets = $(example-names:%=run-%)
+
 doc-names = $(example-names:%=doc/%.html)
 
-tests: quine-tests quine-tests-interp stack-tests
+tests: test-prep quine-tests repl-test
+
+test-prep:
+	rm -rf test-scratch/
+	mkdir -p test-scratch/
+	python3 misc/py/generate-dex-data.py
 
 quine-tests: $(quine-test-targets)
 
-quine-tests-interp: runinterp-eval-tests runinterp-interp-tests
+quine-tests-interp: runinterp-eval-tests runinterp-ad-tests-interp runinterp-interp-tests
 
 run-%: examples/%.dx
-	misc/check-quine $^ $(dex) script --lit --allow-errors
+	misc/check-quine $^ $(dex) script --allow-errors
 
 runinterp-%: examples/%.dx
-	misc/check-quine $^ $(dex) --interp script --lit --allow-errors
+	misc/check-quine $^ $(dex) --interp script --allow-errors
 
-stack-tests:
-	stack test
+# Run these with profiling on while they're catching lots of crashes
+prop-tests: cbits/libdex.so
+	$(STACK) test $(PROF)
 
 update-%: examples/%.dx
-	$(dex) script --lit --allow-errors $^ > $^.tmp
+	$(dex) script --allow-errors $^ > $^.tmp
 	mv $^.tmp $^
+
+repl-test:
+	misc/check-no-diff \
+	  examples/repl-multiline-test-expected-output \
+	  <($(dex) repl < examples/repl-multiline-test.dx)
 
 # --- building docs ---
 
-docs: doc/style.css $(doc-names)
+slow-docs = doc/mnist-nearest-neighbors.html
+
+docs: doc/style.css $(doc-names) $(slow-docs)
 	$(dex) --prelude /dev/null script prelude.dx --html > doc/prelude.html
 
 doc/%.html: examples/%.dx
